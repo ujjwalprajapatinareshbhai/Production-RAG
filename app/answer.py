@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from uuid import UUID
 
 import ollama
 
@@ -84,12 +85,12 @@ def _parse_json(content: str) -> dict:
             )
             return result
 
-        logger.error(
-            "Ollama response did not contain a valid JSON object. "
-            "Response length: %d characters. Raw response: %r",
-            len(content),
-            content[:1000],
-        )
+    logger.error(
+        "Ollama response did not contain a valid JSON object. "
+        "Response length: %d characters. Raw response: %r",
+        len(content),
+        content[:1000],
+    )
     raise ValueError("Ollama returned invalid JSON.")
 
 
@@ -197,6 +198,7 @@ def _insufficient_response(
 
 
 def answer_question(
+    tenant_id: UUID,
     query: str,
     limit: int = 5,
     candidate_limit: int = 20,
@@ -204,13 +206,18 @@ def answer_question(
 ) -> dict:
     """Retrieve, generate, and verify a document-grounded answer."""
 
+    if not isinstance(tenant_id, UUID):
+        raise ValueError("tenant_id must be a UUID.")
+
     if not query or not query.strip():
         raise ValueError("Question cannot be empty.")
 
     query = query.strip()
 
     # Stage 1: Retrieve, rerank, and select context.
+    # Retrieval is restricted to the authenticated tenant.
     chunks = search_documents(
+        tenant_id=tenant_id,
         query=query,
         limit=limit,
         candidate_limit=candidate_limit,

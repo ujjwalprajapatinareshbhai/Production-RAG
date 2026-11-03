@@ -1,3 +1,4 @@
+from uuid import UUID
 
 from app.bm25_retriever import search_bm25
 from app.retriever import search_chunks
@@ -9,6 +10,7 @@ def reciprocal_rank_fusion(
     k: int = 60,
 ) -> list[dict]:
     """Combine ranked search results using Reciprocal Rank Fusion."""
+
     if limit < 1:
         raise ValueError("limit must be at least 1.")
 
@@ -42,12 +44,17 @@ def reciprocal_rank_fusion(
 
 
 def search_hybrid(
+    tenant_id: UUID,
     query: str,
     limit: int = 3,
     candidate_limit: int = 10,
     document_id: str | None = None,
 ) -> list[dict]:
-    """Combine dense and BM25 retrieval using RRF."""
+    """Combine tenant-scoped dense and BM25 retrieval using RRF."""
+
+    if not isinstance(tenant_id, UUID):
+        raise ValueError("tenant_id must be a UUID.")
+
     if not query or not query.strip():
         raise ValueError("Search query cannot be empty.")
 
@@ -57,17 +64,22 @@ def search_hybrid(
     if candidate_limit < 1:
         raise ValueError("candidate_limit must be at least 1.")
 
+    # Stage 1: Semantic retrieval, restricted to this tenant.
     dense_results = search_chunks(
-        query,
+        tenant_id=tenant_id,
+        query=query,
         limit=candidate_limit,
         document_id=document_id,
     )
 
+    # Stage 2: Keyword retrieval, restricted to this tenant.
     bm25_results = search_bm25(
-        query,
+        tenant_id=tenant_id,
+        query=query,
         limit=candidate_limit,
     )
 
+    # Stage 3: Apply optional document-level filtering.
     if document_id is not None:
         bm25_results = [
             result
@@ -75,6 +87,7 @@ def search_hybrid(
             if result.get("document_id") == document_id
         ]
 
+    # Stage 4: Combine both rankings.
     return reciprocal_rank_fusion(
         [dense_results, bm25_results],
         limit=limit,

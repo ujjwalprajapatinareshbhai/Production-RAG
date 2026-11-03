@@ -1,19 +1,34 @@
 import logging
 from typing import Any
-from app.document_management import delete_document
-from fastapi import FastAPI, HTTPException
+from uuid import UUID
+
+import jwt
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    status,
+)
+from fastapi.security import (
+    HTTPAuthorizationCredentials,
+    HTTPBearer,
+)
 from pydantic import BaseModel, Field
 
+from app.answer import answer_question
+from app.auth import decode_access_token
 from app.config import settings
+from app.db import get_connection
+from app.document_management import delete_document
 from app.registry import (
+    get_active_membership,
     get_document,
+    get_user_by_id,
     initialize_registry,
-    list_completed_document_ids,
     list_documents,
 )
 from app.search import search_documents
 from app.vector_store import get_vector_client
-from app.answer import answer_question
 
 
 logger = logging.getLogger(__name__)
@@ -24,12 +39,91 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# HTTP Bearer authentication.
+# auto_error=False allows us to return our own consistent 401 response.
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
 @app.on_event("startup")
 def startup_event() -> None:
     """Initialize required database tables when the API starts."""
     initialize_registry()
     logger.info("Document registry initialized.")
 
+
+# ---------------------------------------------------------
+# Authentication dependency
+# ---------------------------------------------------------
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(
+        bearer_scheme
+    ),
+) -> dict:
+    """
+    Authenticate a request using JWT and verify current
+    user and tenant membership status in PostgreSQL.
+    """
+
+    # Step 1: Require a Bearer token.
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = credentials.credentials
+
+    # Step 2: Decode and validate the JWT.
+    try:
+        payload = decode_access_token(token)
+
+        user_id = UUID(payload["sub"])
+        tenant_id = UUID(payload["tenant_id"])
+
+    except (jwt.PyJWTError, ValueError, TypeError, KeyError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired access token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Step 3: Verify that the user still exists and is active.
+    user = get_user_by_id(user_id)
+
+    if user is None or user.get("is_active") is not True:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account is inactive or does not exist.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Step 4: Verify active membership in the selected tenant.
+    membership = get_active_membership(
+        tenant_id=tenant_id,
+        user_id=user_id,
+    )
+
+    if membership is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have active membership in this tenant.",
+        )
+
+    # Step 5: Return trusted identity information.
+    # The role comes from PostgreSQL, NOT the JWT.
+    return {
+        "user_id": user_id,
+        "tenant_id": tenant_id,
+        "email": user.get("email"),
+        "role": membership["role"],
+    }
+
+
+# ---------------------------------------------------------
+# Request and response models
+# ---------------------------------------------------------
 
 class SearchRequest(BaseModel):
     """Input provided by a client searching the document collection."""
@@ -46,6 +140,7 @@ class SearchResponse(BaseModel):
     query: str
     count: int
     results: list[dict[str, Any]]
+
 
 class AskRequest(BaseModel):
     """Input for document question answering."""
@@ -64,12 +159,14 @@ class AskResponse(BaseModel):
     sources: list[dict[str, Any]]
     insufficient_evidence: bool
 
+
 class DeleteDocumentResponse(BaseModel):
     """Result of deleting a document."""
 
     document_id: str
     filename: str
     status: str
+
 
 class DocumentResponse(BaseModel):
     """Metadata for a registered document."""
@@ -89,12 +186,23 @@ class DocumentListResponse(BaseModel):
     documents: list[DocumentResponse]
 
 
-@app.get("/documents", response_model=DocumentListResponse)
-def get_documents() -> DocumentListResponse:
-    """List all registered documents, regardless of status."""
+# ---------------------------------------------------------
+# Document endpoints
+# ---------------------------------------------------------
+
+@app.get(
+    "/documents",
+    response_model=DocumentListResponse,
+)
+def get_documents(
+    current_user: dict = Depends(get_current_user),
+) -> DocumentListResponse:
+    """List documents belonging only to the authenticated tenant."""
 
     try:
-        documents = list_documents()
+        tenant_id = current_user["tenant_id"]
+
+        documents = list_documents(tenant_id)
 
         return DocumentListResponse(
             count=len(documents),
@@ -114,11 +222,19 @@ def get_documents() -> DocumentListResponse:
     "/documents/{document_id}",
     response_model=DocumentResponse,
 )
-def get_document_by_id(document_id: str) -> DocumentResponse:
-    """Retrieve metadata for one registered document."""
+def get_document_by_id(
+    document_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> DocumentResponse:
+    """Retrieve metadata for a document inside the current tenant."""
 
     try:
-        document = get_document(document_id)
+        tenant_id = current_user["tenant_id"]
+
+        document = get_document(
+            tenant_id,
+            document_id,
+        )
 
         if document is None:
             raise HTTPException(
@@ -139,23 +255,32 @@ def get_document_by_id(document_id: str) -> DocumentResponse:
             detail="Failed to retrieve the document.",
         ) from exc
 
+
 @app.delete(
     "/documents/{document_id}",
     response_model=DeleteDocumentResponse,
 )
 def delete_document_by_id(
     document_id: str,
+    current_user: dict = Depends(get_current_user),
 ) -> DeleteDocumentResponse:
-    """Delete a document and its indexed chunks."""
+    """Delete a document belonging only to the authenticated tenant."""
 
     try:
-        result = delete_document(document_id)
+        tenant_id = current_user["tenant_id"]
+
+        result = delete_document(
+            tenant_id,
+            document_id,
+        )
+
         return DeleteDocumentResponse(**result)
 
     except ValueError as exc:
         status_code = (
             404 if str(exc) == "Document not found." else 400
         )
+
         raise HTTPException(
             status_code=status_code,
             detail=str(exc),
@@ -166,8 +291,16 @@ def delete_document_by_id(
 
         raise HTTPException(
             status_code=500,
-            detail="Document deletion failed. Check the document indexes and registry.",
+            detail=(
+                "Document deletion failed. "
+                "Check the document indexes and registry."
+            ),
         ) from exc
+
+
+# ---------------------------------------------------------
+# Health and readiness endpoints
+# ---------------------------------------------------------
 
 @app.get("/health")
 def health_check() -> dict[str, str]:
@@ -178,18 +311,19 @@ def health_check() -> dict[str, str]:
 
 @app.get("/ready")
 def readiness_check() -> dict[str, str]:
-    """Check whether the API's database and Qdrant dependencies are reachable."""
+    """Check whether PostgreSQL and Qdrant are reachable."""
 
     try:
+        # Check Qdrant.
         client = get_vector_client()
 
-        # Confirm that the configured Qdrant collection exists.
         client.get_collection(
             collection_name=settings.qdrant_collection
         )
 
-        # Access PostgreSQL through the existing document registry.
-        list_completed_document_ids()
+        # Check PostgreSQL independently of any tenant.
+        with get_connection() as conn:
+            conn.execute("SELECT 1")
 
         return {"status": "ready"}
 
@@ -198,13 +332,26 @@ def readiness_check() -> dict[str, str]:
 
         raise HTTPException(
             status_code=503,
-            detail="A required service is unavailable or not configured correctly.",
+            detail=(
+                "A required service is unavailable or "
+                "not configured correctly."
+            ),
         ) from exc
 
 
-@app.post("/search", response_model=SearchResponse)
-def search(request: SearchRequest) -> SearchResponse:
-    """Retrieve and rank relevant passages from completed documents."""
+# ---------------------------------------------------------
+# Search endpoint
+# ---------------------------------------------------------
+
+@app.post(
+    "/search",
+    response_model=SearchResponse,
+)
+def search(
+    request: SearchRequest,
+    current_user: dict = Depends(get_current_user),
+) -> SearchResponse:
+    """Search documents belonging only to the authenticated tenant."""
 
     query = request.query.strip()
 
@@ -216,6 +363,7 @@ def search(request: SearchRequest) -> SearchResponse:
 
     try:
         results = search_documents(
+            tenant_id=current_user["tenant_id"],
             query=query,
             limit=request.limit,
             candidate_limit=request.candidate_limit,
@@ -243,9 +391,19 @@ def search(request: SearchRequest) -> SearchResponse:
         ) from exc
 
 
-@app.post("/ask", response_model=AskResponse)
-def ask(request: AskRequest) -> AskResponse:
-    """Answer a question using retrieved PDF passages."""
+# ---------------------------------------------------------
+# Question-answering endpoint
+# ---------------------------------------------------------
+
+@app.post(
+    "/ask",
+    response_model=AskResponse,
+)
+def ask(
+    request: AskRequest,
+    current_user: dict = Depends(get_current_user),
+) -> AskResponse:
+    """Answer questions using the current tenant's PDF documents."""
 
     query = request.query.strip()
 
@@ -257,6 +415,7 @@ def ask(request: AskRequest) -> AskResponse:
 
     try:
         result = answer_question(
+            tenant_id=current_user["tenant_id"],
             query=query,
             limit=request.limit,
             candidate_limit=request.candidate_limit,

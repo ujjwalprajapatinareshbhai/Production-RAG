@@ -1,6 +1,7 @@
 import logging
 import threading
 from pathlib import Path
+from uuid import UUID
 
 from app.bm25_retriever import refresh_bm25_index
 from app.chunker import chunk_pages
@@ -21,10 +22,15 @@ HEARTBEAT_INTERVAL_SECONDS = 30
 
 def prepare_document(
     pdf_path: str | Path,
+    tenant_id: UUID,
     chunk_size: int = 400,
     overlap: int = 60,
 ):
-    """Load a PDF and prepare its text chunks without storing vectors."""
+    """Load a PDF and prepare tenant-scoped text chunks without storing vectors."""
+
+    if not isinstance(tenant_id, UUID):
+        raise ValueError("tenant_id must be a UUID.")
+
     pdf_path = Path(pdf_path)
 
     pages = load_pdf(pdf_path)
@@ -34,6 +40,7 @@ def prepare_document(
 
     chunks = chunk_pages(
         pages,
+        tenant_id=tenant_id,
         chunk_size=chunk_size,
         overlap=overlap,
     )
@@ -47,6 +54,7 @@ def prepare_document(
 
 
 def _heartbeat_worker(
+    tenant_id: UUID,
     document_id: str,
     stop_event: threading.Event,
     heartbeat_error: list[Exception],
@@ -55,7 +63,10 @@ def _heartbeat_worker(
 
     while not stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
         try:
-            updated = update_document_heartbeat(document_id)
+            updated = update_document_heartbeat(
+                tenant_id,
+                document_id,
+            )
 
             if not updated:
                 raise RuntimeError(
@@ -65,25 +76,34 @@ def _heartbeat_worker(
 
         except Exception as exc:
             heartbeat_error.append(exc)
+
             logger.exception(
-                "Heartbeat failed for document %s",
+                "Heartbeat failed for tenant %s, document %s",
+                tenant_id,
                 document_id,
             )
+
             stop_event.set()
             return
 
 
 def ingest_document(
     pdf_path: str | Path,
+    tenant_id: UUID,
     chunk_size: int = 400,
     overlap: int = 60,
 ) -> dict:
-    """Prepare a PDF, store its vectors, and track ingestion status."""
+    """Prepare a PDF, store its tenant-scoped vectors, and track ingestion status."""
+
+    if not isinstance(tenant_id, UUID):
+        raise ValueError("tenant_id must be a UUID.")
+
     pdf_path = Path(pdf_path)
 
-    # Stage 1: Prepare the document.
+    # Stage 1: Prepare the document with tenant ownership.
     chunks = prepare_document(
         pdf_path,
+        tenant_id=tenant_id,
         chunk_size=chunk_size,
         overlap=overlap,
     )
@@ -91,9 +111,18 @@ def ingest_document(
     document_id = chunks[0].document_id
     filename = chunks[0].filename
 
-    # Stage 2: Register the document and mark it as processing.
-    register_document(document_id, filename)
-    update_document_status(document_id, "processing")
+    # Stage 2: Register the document under the correct tenant.
+    register_document(
+        tenant_id,
+        document_id,
+        filename,
+    )
+
+    update_document_status(
+        tenant_id,
+        document_id,
+        "processing",
+    )
 
     stop_event = threading.Event()
     heartbeat_error: list[Exception] = []
@@ -101,7 +130,10 @@ def ingest_document(
 
     try:
         # Stage 3: Validate that the heartbeat works before storage.
-        if not update_document_heartbeat(document_id):
+        if not update_document_heartbeat(
+            tenant_id,
+            document_id,
+        ):
             raise RuntimeError(
                 "Could not refresh heartbeat for processing document "
                 f"{document_id}."
@@ -110,13 +142,19 @@ def ingest_document(
         # Stage 4: Start periodic heartbeat updates.
         heartbeat_thread = threading.Thread(
             target=_heartbeat_worker,
-            args=(document_id, stop_event, heartbeat_error),
+            args=(
+                tenant_id,
+                document_id,
+                stop_event,
+                heartbeat_error,
+            ),
             name=f"heartbeat-{document_id[:8]}",
             daemon=True,
         )
+
         heartbeat_thread.start()
 
-        # Stage 5: Store chunks in Qdrant.
+        # Stage 5: Store tenant-scoped chunks in Qdrant.
         stored_count = upsert_chunks(chunks)
 
         if stored_count != len(chunks):
@@ -136,15 +174,24 @@ def ingest_document(
             ) from heartbeat_error[0]
 
         # Stage 7: Mark ingestion as successful.
-        update_document_status(document_id, "completed")
+        update_document_status(
+            tenant_id,
+            document_id,
+            "completed",
+        )
 
+        # Refresh only this tenant's BM25 index.
         # A BM25 refresh failure should not undo successful ingestion.
         try:
-            refresh_bm25_index()
+            refresh_bm25_index(tenant_id)
         except Exception:
-            logger.exception("BM25 index refresh failed")
+            logger.exception(
+                "BM25 index refresh failed for tenant %s",
+                tenant_id,
+            )
 
         return {
+            "tenant_id": str(tenant_id),
             "document_id": document_id,
             "filename": filename,
             "chunks_prepared": len(chunks),
@@ -166,22 +213,28 @@ def ingest_document(
                 f"{heartbeat_error[0]}"
             )
 
-        # Stage 8: Mark the document as failed.
+        # Stage 8: Mark this tenant's document as failed.
         try:
             update_document_status(
+                tenant_id,
                 document_id,
                 "failed",
                 error_message=str(exc),
             )
+
         except Exception as status_exc:
             exc.add_note(
                 "Additionally, failed to update the document "
                 f"status to 'failed': {status_exc}"
             )
 
-        # Stage 9: Clean up any partially stored vectors.
+        # Stage 9: Delete only this tenant's partially stored vectors.
         try:
-            delete_document_chunks(document_id)
+            delete_document_chunks(
+                tenant_id,
+                document_id,
+            )
+
         except Exception as cleanup_exc:
             exc.add_note(
                 "Additionally, failed to clean up partially stored "

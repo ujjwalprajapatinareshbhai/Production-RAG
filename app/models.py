@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from uuid import UUID
+
 
 @dataclass
 class Page:
@@ -7,9 +9,11 @@ class Page:
     page_number: int
     text: str
 
+
 @dataclass
 class Chunk:
     chunk_id: str
+    tenant_id: UUID
     document_id: str
     filename: str
     chunk_index: int

@@ -34,3 +34,6 @@ data/
 # Models and caches
 models/
 .cache/
+
+# Production and local backups
+backups/

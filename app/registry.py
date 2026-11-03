@@ -1,4 +1,4 @@
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from psycopg.rows import dict_row
 
@@ -12,80 +12,470 @@ VALID_STATUSES = {
     "failed",
 }
 
+VALID_ROLES = {
+    "owner",
+    "admin",
+    "member",
+}
+
+
+# =========================================================
+# DATABASE INITIALIZATION
+# =========================================================
 
 def initialize_registry() -> None:
-    """Create the documents table and apply schema migrations."""
-
-    create_table_sql = """
-        CREATE TABLE IF NOT EXISTS documents (
-            document_id TEXT PRIMARY KEY
-                CHECK (length(document_id) = 64),
-
-            filename TEXT NOT NULL,
-
-            status TEXT NOT NULL DEFAULT 'pending'
-                CHECK (
-                    status IN (
-                        'pending',
-                        'processing',
-                        'completed',
-                        'failed'
-                    )
-                ),
-
-            error_message TEXT,
-
-            cleanup_pending BOOLEAN NOT NULL DEFAULT FALSE,
-            cleanup_error TEXT,
-            cleanup_claimed_at TIMESTAMPTZ,
-            cleanup_claim_token UUID,
-
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
     """
+    Initialize the multi-tenant PostgreSQL schema.
 
-    # Add columns to databases where the table already exists.
-    # IF NOT EXISTS makes these migrations safe to run repeatedly.
-    alter_table_sql = """
-        ALTER TABLE documents
-        ADD COLUMN IF NOT EXISTS cleanup_pending
-            BOOLEAN NOT NULL DEFAULT FALSE;
-
-        ALTER TABLE documents
-        ADD COLUMN IF NOT EXISTS cleanup_error TEXT;
-
-        ALTER TABLE documents
-        ADD COLUMN IF NOT EXISTS cleanup_claimed_at TIMESTAMPTZ;
-
-        ALTER TABLE documents
-        ADD COLUMN IF NOT EXISTS cleanup_claim_token UUID;
+    Safe to run repeatedly against an existing database.
+    Existing documents are assigned to Legacy Workspace
+    if they do not already have a tenant.
     """
 
     with get_connection() as conn:
-        conn.execute(create_table_sql)
-        conn.execute(alter_table_sql)
 
+        # -------------------------------------------------
+        # 1. Tenants
+        # -------------------------------------------------
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tenants (
+                tenant_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+                CONSTRAINT tenants_name_not_empty
+                    CHECK (length(trim(name)) > 0),
+
+                CONSTRAINT tenants_slug_not_empty
+                    CHECK (length(trim(slug)) > 0)
+            );
+        """)
+
+        # -------------------------------------------------
+        # 2. Users
+        # -------------------------------------------------
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                email TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+                CONSTRAINT users_email_not_empty
+                    CHECK (length(trim(email)) > 0),
+
+                CONSTRAINT users_password_hash_not_empty
+                    CHECK (length(trim(password_hash)) > 0)
+            );
+        """)
+
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique
+            ON users (lower(email));
+        """)
+
+        # -------------------------------------------------
+        # 3. Tenant memberships
+        # -------------------------------------------------
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tenant_memberships (
+                tenant_id UUID NOT NULL,
+                user_id UUID NOT NULL,
+
+                role TEXT NOT NULL DEFAULT 'member',
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+                PRIMARY KEY (tenant_id, user_id),
+
+                CONSTRAINT tenant_memberships_tenant_fk
+                    FOREIGN KEY (tenant_id)
+                    REFERENCES tenants (tenant_id)
+                    ON DELETE CASCADE,
+
+                CONSTRAINT tenant_memberships_user_fk
+                    FOREIGN KEY (user_id)
+                    REFERENCES users (user_id)
+                    ON DELETE CASCADE,
+
+                CONSTRAINT tenant_memberships_role_check
+                    CHECK (role IN ('owner', 'admin', 'member'))
+            );
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS tenant_memberships_user_idx
+            ON tenant_memberships (user_id);
+        """)
+
+        # -------------------------------------------------
+        # 4. Documents table
+        # -------------------------------------------------
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                document_id TEXT NOT NULL
+                    CHECK (length(document_id) = 64),
+
+                tenant_id UUID NOT NULL,
+
+                filename TEXT NOT NULL,
+
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (
+                        status IN (
+                            'pending',
+                            'processing',
+                            'completed',
+                            'failed'
+                        )
+                    ),
+
+                error_message TEXT,
+
+                cleanup_pending BOOLEAN NOT NULL DEFAULT FALSE,
+                cleanup_error TEXT,
+                cleanup_claimed_at TIMESTAMPTZ,
+                cleanup_claim_token UUID,
+
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+                PRIMARY KEY (tenant_id, document_id),
+
+                CONSTRAINT documents_tenant_fk
+                    FOREIGN KEY (tenant_id)
+                    REFERENCES tenants (tenant_id)
+                    ON DELETE RESTRICT
+            );
+        """)
+
+        # -------------------------------------------------
+        # 5. Add missing columns to existing databases
+        # -------------------------------------------------
+
+        conn.execute("""
+            ALTER TABLE documents
+            ADD COLUMN IF NOT EXISTS tenant_id UUID;
+        """)
+
+        conn.execute("""
+            ALTER TABLE documents
+            ADD COLUMN IF NOT EXISTS cleanup_pending
+                BOOLEAN NOT NULL DEFAULT FALSE;
+
+            ALTER TABLE documents
+            ADD COLUMN IF NOT EXISTS cleanup_error TEXT;
+
+            ALTER TABLE documents
+            ADD COLUMN IF NOT EXISTS cleanup_claimed_at TIMESTAMPTZ;
+
+            ALTER TABLE documents
+            ADD COLUMN IF NOT EXISTS cleanup_claim_token UUID;
+        """)
+
+        # -------------------------------------------------
+        # 6. Create the legacy workspace
+        # -------------------------------------------------
+
+        conn.execute("""
+            INSERT INTO tenants (name, slug)
+            VALUES ('Legacy Workspace', 'legacy-workspace')
+            ON CONFLICT (slug) DO NOTHING;
+        """)
+
+        # -------------------------------------------------
+        # 7. Assign existing documents to Legacy Workspace
+        # -------------------------------------------------
+
+        conn.execute("""
+            UPDATE documents
+            SET tenant_id = (
+                SELECT tenant_id
+                FROM tenants
+                WHERE slug = 'legacy-workspace'
+            )
+            WHERE tenant_id IS NULL;
+        """)
+
+        # -------------------------------------------------
+        # 8. Ensure tenant foreign key exists
+        # -------------------------------------------------
+
+        conn.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'documents_tenant_fk'
+                      AND conrelid = 'documents'::regclass
+                ) THEN
+                    ALTER TABLE documents
+                    ADD CONSTRAINT documents_tenant_fk
+                    FOREIGN KEY (tenant_id)
+                    REFERENCES tenants (tenant_id)
+                    ON DELETE RESTRICT;
+                END IF;
+            END $$;
+        """)
+
+        # -------------------------------------------------
+        # 9. Ensure tenant_id is mandatory
+        # -------------------------------------------------
+
+        conn.execute("""
+            ALTER TABLE documents
+            ALTER COLUMN tenant_id SET NOT NULL;
+        """)
+
+        # -------------------------------------------------
+        # 10. Ensure composite primary key
+        # -------------------------------------------------
+
+        conn.execute("""
+            DO $$
+            DECLARE
+                current_pk_columns TEXT[];
+            BEGIN
+                SELECT array_agg(a.attname ORDER BY k.ordinality)
+                INTO current_pk_columns
+                FROM pg_constraint c
+                CROSS JOIN LATERAL
+                    unnest(c.conkey) WITH ORDINALITY AS k(attnum, ordinality)
+                JOIN pg_attribute a
+                    ON a.attrelid = c.conrelid
+                   AND a.attnum = k.attnum
+                WHERE c.conrelid = 'documents'::regclass
+                  AND c.contype = 'p';
+
+                IF current_pk_columns IS DISTINCT FROM
+                   ARRAY['tenant_id', 'document_id']::TEXT[] THEN
+
+                    IF EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE contype = 'f'
+                          AND confrelid = 'documents'::regclass
+                    ) THEN
+                        RAISE EXCEPTION
+                            'Cannot replace documents primary key: '
+                            'referencing foreign keys exist.';
+                    END IF;
+
+                    IF current_pk_columns IS NOT NULL THEN
+                        ALTER TABLE documents
+                        DROP CONSTRAINT documents_pkey;
+                    END IF;
+
+                    ALTER TABLE documents
+                    ADD CONSTRAINT documents_pkey
+                    PRIMARY KEY (tenant_id, document_id);
+                END IF;
+            END $$;
+        """)
+
+        # -------------------------------------------------
+        # 11. Tenant-aware document index
+        # -------------------------------------------------
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS documents_tenant_created_idx
+            ON documents (tenant_id, created_at DESC);
+        """)
+
+
+# =========================================================
+# TENANT OPERATIONS
+# =========================================================
+
+def create_tenant(
+    name: str,
+    slug: str,
+) -> dict:
+
+    if not name or not name.strip():
+        raise ValueError("Tenant name cannot be empty.")
+
+    if not slug or not slug.strip():
+        raise ValueError("Tenant slug cannot be empty.")
+
+    sql = """
+        INSERT INTO tenants (name, slug)
+        VALUES (%s, %s)
+        RETURNING *;
+    """
+
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(sql, (name.strip(), slug.strip()))
+            return cursor.fetchone()
+
+
+def get_tenant(tenant_id: UUID) -> dict | None:
+
+    sql = """
+        SELECT *
+        FROM tenants
+        WHERE tenant_id = %s;
+    """
+
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(sql, (tenant_id,))
+            return cursor.fetchone()
+
+
+# =========================================================
+# USER OPERATIONS
+# =========================================================
+
+def create_user(
+    email: str,
+    password_hash: str,
+) -> dict:
+
+    if not email or not email.strip():
+        raise ValueError("Email cannot be empty.")
+
+    if not password_hash:
+        raise ValueError("Password hash cannot be empty.")
+
+    sql = """
+        INSERT INTO users (email, password_hash)
+        VALUES (%s, %s)
+        RETURNING user_id, email, is_active, created_at;
+    """
+
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                sql,
+                (email.strip().lower(), password_hash),
+            )
+            return cursor.fetchone()
+
+
+def get_user_by_email(email: str) -> dict | None:
+
+    sql = """
+        SELECT *
+        FROM users
+        WHERE lower(email) = lower(%s);
+    """
+
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(sql, (email,))
+            return cursor.fetchone()
+
+
+def get_user_by_id(user_id: UUID) -> dict | None:
+
+    sql = """
+        SELECT *
+        FROM users
+        WHERE user_id = %s;
+    """
+
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(sql, (user_id,))
+            return cursor.fetchone()
+
+
+# =========================================================
+# MEMBERSHIP OPERATIONS
+# =========================================================
+
+def create_membership(
+    tenant_id: UUID,
+    user_id: UUID,
+    role: str = "member",
+) -> dict:
+
+    if role not in VALID_ROLES:
+        raise ValueError(
+            f"Invalid role: {role}. "
+            f"Allowed roles: {sorted(VALID_ROLES)}"
+        )
+
+    sql = """
+        INSERT INTO tenant_memberships (
+            tenant_id,
+            user_id,
+            role
+        )
+        VALUES (%s, %s, %s)
+        RETURNING *;
+    """
+
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                sql,
+                (tenant_id, user_id, role),
+            )
+            return cursor.fetchone()
+
+
+def get_active_membership(
+    tenant_id: UUID,
+    user_id: UUID,
+) -> dict | None:
+
+    sql = """
+        SELECT
+            tenant_id,
+            user_id,
+            role,
+            is_active,
+            created_at
+        FROM tenant_memberships
+        WHERE tenant_id = %s
+          AND user_id = %s
+          AND is_active = TRUE;
+    """
+
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(sql, (tenant_id, user_id))
+            return cursor.fetchone()
+
+
+# =========================================================
+# DOCUMENT REGISTRY
+# =========================================================
 
 def register_document(
+    tenant_id: UUID,
     document_id: str,
     filename: str,
 ) -> dict:
-    """Register a PDF, without resetting an existing document's status."""
 
     if len(document_id) != 64:
         raise ValueError(
             "document_id must be a 64-character SHA-256 hash."
         )
 
-    if not filename.strip():
+    if not filename or not filename.strip():
         raise ValueError("filename cannot be empty.")
 
     sql = """
-        INSERT INTO documents (document_id, filename)
-        VALUES (%s, %s)
+        INSERT INTO documents (
+            tenant_id,
+            document_id,
+            filename
+        )
+        VALUES (%s, %s, %s)
 
-        ON CONFLICT (document_id)
+        ON CONFLICT (tenant_id, document_id)
         DO UPDATE SET
             filename = EXCLUDED.filename,
             updated_at = NOW()
@@ -95,31 +485,37 @@ def register_document(
 
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(sql, (document_id, filename))
+            cursor.execute(
+                sql,
+                (tenant_id, document_id, filename),
+            )
             return cursor.fetchone()
 
 
-def get_document(document_id: str) -> dict | None:
-    """Retrieve a registered document by its SHA-256 hash."""
+def get_document(
+    tenant_id: UUID,
+    document_id: str,
+) -> dict | None:
 
     sql = """
         SELECT *
         FROM documents
-        WHERE document_id = %s;
+        WHERE tenant_id = %s
+          AND document_id = %s;
     """
 
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(sql, (document_id,))
+            cursor.execute(sql, (tenant_id, document_id))
             return cursor.fetchone()
 
 
 def update_document_status(
+    tenant_id: UUID,
     document_id: str,
     status: str,
     error_message: str | None = None,
 ) -> dict | None:
-    """Update processing status and optionally record an error."""
 
     if status not in VALID_STATUSES:
         raise ValueError(
@@ -133,7 +529,8 @@ def update_document_status(
             status = %s,
             error_message = %s,
             updated_at = NOW()
-        WHERE document_id = %s
+        WHERE tenant_id = %s
+          AND document_id = %s
         RETURNING *;
     """
 
@@ -141,31 +538,39 @@ def update_document_status(
         with conn.cursor(row_factory=dict_row) as cursor:
             cursor.execute(
                 sql,
-                (status, error_message, document_id),
+                (
+                    status,
+                    error_message,
+                    tenant_id,
+                    document_id,
+                ),
             )
             return cursor.fetchone()
 
 
-def list_completed_document_ids() -> list[str]:
-    """Return document IDs whose ingestion status is completed."""
+def list_completed_document_ids(
+    tenant_id: UUID,
+) -> list[str]:
 
     sql = """
         SELECT document_id
         FROM documents
-        WHERE status = 'completed'
+        WHERE tenant_id = %s
+          AND status = 'completed'
         ORDER BY document_id;
     """
 
     with get_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute(sql)
+            cursor.execute(sql, (tenant_id,))
             rows = cursor.fetchall()
 
     return [row[0] for row in rows]
 
 
-def list_documents() -> list[dict]:
-    """Return all registered documents, newest first."""
+def list_documents(
+    tenant_id: UUID,
+) -> list[dict]:
 
     sql = """
         SELECT
@@ -180,50 +585,72 @@ def list_documents() -> list[dict]:
             created_at,
             updated_at
         FROM documents
+        WHERE tenant_id = %s
         ORDER BY created_at DESC, document_id;
     """
 
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(sql)
+            cursor.execute(sql, (tenant_id,))
             return cursor.fetchall()
 
 
-def delete_document_record(document_id: str) -> bool:
-    """Delete a document registry record."""
+def delete_document_record(
+    tenant_id: UUID,
+    document_id: str,
+) -> bool:
 
     sql = """
         DELETE FROM documents
-        WHERE document_id = %s
+        WHERE tenant_id = %s
+          AND document_id = %s
         RETURNING document_id;
     """
 
     with get_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute(sql, (document_id,))
+            cursor.execute(sql, (tenant_id, document_id))
             return cursor.fetchone() is not None
 
+
+# =========================================================
+# HEARTBEAT
+# =========================================================
+
+def update_document_heartbeat(
+    tenant_id: UUID,
+    document_id: str,
+) -> bool:
+
+    sql = """
+        UPDATE documents
+        SET updated_at = NOW()
+        WHERE tenant_id = %s
+          AND document_id = %s
+          AND status = 'processing'
+        RETURNING document_id;
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(sql, (tenant_id, document_id))
+            return cursor.fetchone() is not None
+
+
+# =========================================================
+# STALE DOCUMENT RECOVERY
+# System-wide trusted background operations
+# =========================================================
 
 def list_stale_documents(
     stale_after_minutes: int = 30,
 ) -> list[dict]:
-    """Return pending or processing documents older than a cutoff."""
 
     if stale_after_minutes < 1:
         raise ValueError("stale_after_minutes must be at least 1.")
 
     sql = """
-        SELECT
-            document_id,
-            filename,
-            status,
-            error_message,
-            cleanup_pending,
-            cleanup_error,
-            cleanup_claimed_at,
-            cleanup_claim_token,
-            created_at,
-            updated_at
+        SELECT *
         FROM documents
         WHERE status IN ('pending', 'processing')
           AND updated_at < NOW() - (%s * INTERVAL '1 minute')
@@ -236,32 +663,9 @@ def list_stale_documents(
             return cursor.fetchall()
 
 
-def update_document_heartbeat(document_id: str) -> bool:
-    """Refresh the heartbeat for a document currently being processed."""
-
-    sql = """
-        UPDATE documents
-        SET updated_at = NOW()
-        WHERE document_id = %s
-          AND status = 'processing'
-        RETURNING document_id;
-    """
-
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(sql, (document_id,))
-            return cursor.fetchone() is not None
-
-
 def mark_stale_documents_failed(
     stale_after_minutes: int = 30,
 ) -> list[dict]:
-    """
-    Mark stale pending and processing documents as failed.
-
-    Also marks their vector cleanup as pending so a later recovery
-    process can retry cleanup if Qdrant is unavailable.
-    """
 
     if stale_after_minutes < 1:
         raise ValueError("stale_after_minutes must be at least 1.")
@@ -278,17 +682,7 @@ def mark_stale_documents_failed(
             updated_at = NOW()
         WHERE status IN ('pending', 'processing')
           AND updated_at < NOW() - (%s * INTERVAL '1 minute')
-        RETURNING
-            document_id,
-            filename,
-            status,
-            error_message,
-            cleanup_pending,
-            cleanup_error,
-            cleanup_claimed_at,
-            cleanup_claim_token,
-            created_at,
-            updated_at;
+        RETURNING *;
     """
 
     with get_connection() as conn:
@@ -297,20 +691,14 @@ def mark_stale_documents_failed(
             return cursor.fetchall()
 
 
+# =========================================================
+# PENDING CLEANUP
+# =========================================================
+
 def list_pending_cleanup_documents() -> list[dict]:
-    """Return documents that still require vector cleanup."""
 
     sql = """
-        SELECT
-            document_id,
-            filename,
-            status,
-            cleanup_pending,
-            cleanup_error,
-            cleanup_claimed_at,
-            cleanup_claim_token,
-            created_at,
-            updated_at
+        SELECT *
         FROM documents
         WHERE cleanup_pending = TRUE
         ORDER BY updated_at ASC;
@@ -323,14 +711,10 @@ def list_pending_cleanup_documents() -> list[dict]:
 
 
 def mark_document_cleanup_completed(
+    tenant_id: UUID,
     document_id: str,
     claim_token: UUID,
 ) -> dict | None:
-    """
-    Mark cleanup as completed only if the supplied token owns the lease.
-
-    A worker with an expired or replaced token cannot complete the task.
-    """
 
     sql = """
         UPDATE documents
@@ -340,7 +724,8 @@ def mark_document_cleanup_completed(
             cleanup_claimed_at = NULL,
             cleanup_claim_token = NULL,
             updated_at = NOW()
-        WHERE document_id = %s
+        WHERE tenant_id = %s
+          AND document_id = %s
           AND cleanup_pending = TRUE
           AND cleanup_claim_token = %s
         RETURNING *;
@@ -348,22 +733,21 @@ def mark_document_cleanup_completed(
 
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(sql, (document_id, claim_token))
+            cursor.execute(
+                sql,
+                (tenant_id, document_id, claim_token),
+            )
             return cursor.fetchone()
 
 
 def mark_document_cleanup_failed(
+    tenant_id: UUID,
     document_id: str,
     error_message: str,
     claim_token: UUID,
 ) -> dict | None:
-    """
-    Record cleanup failure only if the supplied token owns the lease.
 
-    Keeps cleanup pending so a future recovery run can retry it.
-    """
-
-    if not error_message.strip():
+    if not error_message or not error_message.strip():
         raise ValueError("error_message cannot be empty.")
 
     sql = """
@@ -374,7 +758,8 @@ def mark_document_cleanup_failed(
             cleanup_claimed_at = NULL,
             cleanup_claim_token = NULL,
             updated_at = NOW()
-        WHERE document_id = %s
+        WHERE tenant_id = %s
+          AND document_id = %s
           AND cleanup_pending = TRUE
           AND cleanup_claim_token = %s
         RETURNING *;
@@ -384,7 +769,12 @@ def mark_document_cleanup_failed(
         with conn.cursor(row_factory=dict_row) as cursor:
             cursor.execute(
                 sql,
-                (error_message, document_id, claim_token),
+                (
+                    error_message,
+                    tenant_id,
+                    document_id,
+                    claim_token,
+                ),
             )
             return cursor.fetchone()
 
@@ -393,14 +783,6 @@ def claim_pending_cleanup_documents(
     limit: int = 10,
     lease_minutes: int = 15,
 ) -> list[dict]:
-    """
-    Atomically claim pending cleanup tasks.
-
-    A task can be claimed when it has no active lease or
-    its previous lease has expired.
-
-    Every claim receives a new UUID fencing token.
-    """
 
     if limit < 1:
         raise ValueError("limit must be at least 1.")
@@ -410,7 +792,7 @@ def claim_pending_cleanup_documents(
 
     sql = """
         WITH candidates AS (
-            SELECT document_id
+            SELECT tenant_id, document_id
             FROM documents
             WHERE cleanup_pending = TRUE
               AND (
@@ -427,7 +809,8 @@ def claim_pending_cleanup_documents(
             cleanup_claimed_at = NOW(),
             cleanup_claim_token = gen_random_uuid()
         FROM candidates
-        WHERE d.document_id = candidates.document_id
+        WHERE d.tenant_id = candidates.tenant_id
+          AND d.document_id = candidates.document_id
         RETURNING d.*;
     """
 

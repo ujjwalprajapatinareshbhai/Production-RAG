@@ -38,5 +38,12 @@ class Settings(BaseSettings):
     postgres_user: str
     postgres_password: str
 
+    # JWT authentication
+    jwt_secret_key: str
+    jwt_algorithm: str = "HS256"
+    jwt_issuer: str = "production-rag"
+    jwt_audience: str = "production-rag-api"
+    access_token_expire_minutes: int = 15
+
 
 settings = Settings()

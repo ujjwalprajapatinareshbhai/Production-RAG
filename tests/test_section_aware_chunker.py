@@ -1,8 +1,11 @@
 import re
+from uuid import UUID
 
 from app.chunker import chunk_pages_by_section
 from app.models import Page
 
+
+TEST_TENANT_ID = UUID("22222222-2222-2222-2222-222222222222")
 
 DOCUMENT_ID = "a" * 64
 FILENAME = "test_document.pdf"
@@ -44,7 +47,14 @@ def test_skips_table_of_contents_and_preserves_abstract():
         ),
     ]
 
-    chunks = chunk_pages_by_section(pages, chunk_size=100, overlap=10)
+    chunks = chunk_pages_by_section(
+        pages,
+        tenant_id=TEST_TENANT_ID,
+        chunk_size=100,
+        overlap=10,
+    )
+
+    assert all(chunk.tenant_id == TEST_TENANT_ID for chunk in chunks)
 
     abstract_chunks = [
         chunk for chunk in chunks
@@ -81,9 +91,15 @@ def test_numbered_list_items_do_not_start_new_sections():
         ),
     ]
 
-    chunks = chunk_pages_by_section(pages, chunk_size=100, overlap=10)
+    chunks = chunk_pages_by_section(
+        pages,
+        tenant_id=TEST_TENANT_ID,
+        chunk_size=100,
+        overlap=10,
+    )
 
     assert len(chunks) == 1
+    assert chunks[0].tenant_id == TEST_TENANT_ID
 
     text = chunks[0].text
 
@@ -110,12 +126,18 @@ def test_page_metadata_tracks_paragraphs_across_pages():
         ),
     ]
 
-    chunks = chunk_pages_by_section(pages, chunk_size=100, overlap=0)
+    chunks = chunk_pages_by_section(
+        pages,
+        tenant_id=TEST_TENANT_ID,
+        chunk_size=100,
+        overlap=0,
+    )
 
     assert len(chunks) == 1
 
     chunk = chunks[0]
 
+    assert chunk.tenant_id == TEST_TENANT_ID
     assert chunk.source_pages == [1, 2]
     assert chunk.start_page == 1
     assert chunk.end_page == 2
@@ -132,9 +154,15 @@ def test_chunks_respect_word_limit_and_have_unique_text():
         ),
     ]
 
-    chunks = chunk_pages_by_section(pages, chunk_size=100, overlap=10)
+    chunks = chunk_pages_by_section(
+        pages,
+        tenant_id=TEST_TENANT_ID,
+        chunk_size=100,
+        overlap=10,
+    )
 
     assert len(chunks) > 1
+    assert all(chunk.tenant_id == TEST_TENANT_ID for chunk in chunks)
     assert all(len(chunk.text.split()) <= 100 for chunk in chunks)
     assert len({chunk.text for chunk in chunks}) == len(chunks)
 
@@ -150,6 +178,7 @@ def test_invalid_chunk_settings_are_rejected():
         try:
             chunk_pages_by_section(
                 pages,
+                tenant_id=TEST_TENANT_ID,
                 chunk_size=chunk_size,
                 overlap=overlap,
             )

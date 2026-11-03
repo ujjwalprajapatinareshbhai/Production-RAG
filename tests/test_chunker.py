@@ -1,7 +1,10 @@
+from uuid import UUID
 
 from app.models import Page
-from app.chunker import chunk_pages
-from app.chunker import extract_abstract_chunk
+from app.chunker import chunk_pages, extract_abstract_chunk
+
+
+TEST_TENANT_ID = UUID("22222222-2222-2222-2222-222222222222")
 
 
 def make_pages() -> list[Page]:
@@ -25,7 +28,13 @@ def make_pages() -> list[Page]:
 
 def test_chunk_count_and_overlap():
     pages = make_pages()
-    chunks = chunk_pages(pages, chunk_size=8, overlap=2)
+
+    chunks = chunk_pages(
+        pages,
+        tenant_id=TEST_TENANT_ID,
+        chunk_size=8,
+        overlap=2,
+    )
 
     assert len(chunks) == 3
     assert chunks[0].text.split()[-2:] == ["word7", "word8"]
@@ -34,7 +43,13 @@ def test_chunk_count_and_overlap():
 
 def test_page_metadata():
     pages = make_pages()
-    chunks = chunk_pages(pages, chunk_size=8, overlap=2)
+
+    chunks = chunk_pages(
+        pages,
+        tenant_id=TEST_TENANT_ID,
+        chunk_size=8,
+        overlap=2,
+    )
 
     assert chunks[0].start_page == 1
     assert chunks[0].end_page == 1
@@ -46,11 +61,17 @@ def test_page_metadata():
 
 def test_invalid_overlap():
     try:
-        chunk_pages(make_pages(), chunk_size=8, overlap=8)
+        chunk_pages(
+            make_pages(),
+            tenant_id=TEST_TENANT_ID,
+            chunk_size=8,
+            overlap=8,
+        )
     except ValueError:
         pass
     else:
         raise AssertionError("Expected ValueError for invalid overlap")
+
 
 def test_extract_abstract_chunk():
     pages = [
@@ -68,9 +89,13 @@ def test_extract_abstract_chunk():
         )
     ]
 
-    chunk = extract_abstract_chunk(pages)
+    chunk = extract_abstract_chunk(
+        pages,
+        tenant_id=TEST_TENANT_ID,
+    )
 
     assert chunk is not None
+    assert chunk.tenant_id == TEST_TENANT_ID
     assert chunk.source_pages == [5]
     assert "software testing problems" in chunk.text
     assert "improved testing process" in chunk.text
@@ -88,7 +113,10 @@ def test_extract_abstract_returns_none_when_missing():
         )
     ]
 
-    assert extract_abstract_chunk(pages) is None
+    assert extract_abstract_chunk(
+        pages,
+        tenant_id=TEST_TENANT_ID,
+    ) is None
 
 
 def test_extract_abstract_returns_none_when_empty():
@@ -101,9 +129,12 @@ def test_extract_abstract_returns_none_when_empty():
         )
     ]
 
-    assert extract_abstract_chunk(pages) is None
+    assert extract_abstract_chunk(
+        pages,
+        tenant_id=TEST_TENANT_ID,
+    ) is None
 
-    
+
 if __name__ == "__main__":
     test_chunk_count_and_overlap()
     test_page_metadata()

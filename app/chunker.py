@@ -1,18 +1,26 @@
 import hashlib
 import re
+from uuid import UUID
 
 from app.models import Chunk, Page
 from app.text_cleaner import clean_text
 
 
 def generate_chunk_id(
+    tenant_id: UUID,
     document_id: str,
     chunk_index: int,
     chunk_text: str,
 ) -> str:
-    """Generate a stable ID for the same document chunk."""
-    identity = f"{document_id}:{chunk_index}:{chunk_text}"
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    """Generate a stable, tenant-specific chunk ID."""
+
+    identity = (
+        f"{tenant_id}:{document_id}:{chunk_index}:{chunk_text}"
+    )
+
+    return hashlib.sha256(
+        identity.encode("utf-8")
+    ).hexdigest()
 
 
 def _validate_chunk_settings(
@@ -20,6 +28,7 @@ def _validate_chunk_settings(
     overlap: int,
 ) -> None:
     """Validate settings shared by all chunking strategies."""
+
     if chunk_size <= 0:
         raise ValueError("chunk_size must be greater than 0")
 
@@ -32,6 +41,7 @@ def _validate_chunk_settings(
 
 def _validate_pages(pages: list[Page]) -> None:
     """Ensure all pages belong to the same document and filename."""
+
     if not pages:
         return
 
@@ -49,6 +59,8 @@ def chunk_pages(
     pages: list[Page],
     chunk_size: int = 400,
     overlap: int = 60,
+    *,
+    tenant_id: UUID,
 ) -> list[Chunk]:
     """
     Split pages into overlapping word-based chunks.
@@ -56,6 +68,7 @@ def chunk_pages(
     Preserve paragraph boundaries and track the source pages
     represented in every chunk.
     """
+
     _validate_chunk_settings(chunk_size, overlap)
 
     if not pages:
@@ -106,10 +119,12 @@ def chunk_pages(
         chunks.append(
             Chunk(
                 chunk_id=generate_chunk_id(
+                    tenant_id=tenant_id,
                     document_id=document_id,
                     chunk_index=chunk_index,
                     chunk_text=chunk_text,
                 ),
+                tenant_id=tenant_id,
                 document_id=document_id,
                 filename=filename,
                 chunk_index=chunk_index,
@@ -130,12 +145,15 @@ def chunk_pages_independently(
     pages: list[Page],
     chunk_size: int = 400,
     overlap: int = 60,
+    *,
+    tenant_id: UUID,
 ) -> list[Chunk]:
     """
     Experimental strategy: chunk each page independently.
 
     Chunks never combine text from different PDF pages.
     """
+
     _validate_chunk_settings(chunk_size, overlap)
 
     if not pages:
@@ -160,10 +178,12 @@ def chunk_pages_independently(
             chunks.append(
                 Chunk(
                     chunk_id=generate_chunk_id(
+                        tenant_id=tenant_id,
                         document_id=page.document_id,
                         chunk_index=chunk_index,
                         chunk_text=chunk_text,
                     ),
+                    tenant_id=tenant_id,
                     document_id=page.document_id,
                     filename=page.filename,
                     chunk_index=chunk_index,
@@ -180,12 +200,17 @@ def chunk_pages_independently(
     return chunks
 
 
-def extract_abstract_chunk(pages: list[Page]) -> Chunk | None:
+def extract_abstract_chunk(
+    pages: list[Page],
+    *,
+    tenant_id: UUID,
+) -> Chunk | None:
     """
     Extract the abstract as a standalone chunk.
 
     Stops at the next numbered section heading.
     """
+
     abstract_heading = re.compile(
         r"^\s*(?:\d+\s+)?abstract\s*$",
         re.IGNORECASE,
@@ -217,10 +242,12 @@ def extract_abstract_chunk(pages: list[Page]) -> Chunk | None:
 
             return Chunk(
                 chunk_id=generate_chunk_id(
+                    tenant_id=tenant_id,
                     document_id=page.document_id,
                     chunk_index=page.page_number,
                     chunk_text=abstract_text,
                 ),
+                tenant_id=tenant_id,
                 document_id=page.document_id,
                 filename=page.filename,
                 chunk_index=page.page_number,
@@ -237,6 +264,8 @@ def chunk_pages_by_section(
     pages: list[Page],
     chunk_size: int = 400,
     overlap: int = 60,
+    *,
+    tenant_id: UUID,
 ) -> list[Chunk]:
     """
     Create section-aware chunks without changing the production chunker.
@@ -249,6 +278,7 @@ def chunk_pages_by_section(
     - Keeps each chunk within chunk_size words, including its heading.
     - Applies overlap within each section, never across sections.
     """
+
     _validate_chunk_settings(chunk_size, overlap)
 
     if not pages:
@@ -262,6 +292,7 @@ def chunk_pages_by_section(
     # ---------------------------------------------------------
     # 1. Find the Table of Contents and the Abstract.
     # ---------------------------------------------------------
+
     toc_start_index = None
     abstract_page_index = None
 
@@ -310,6 +341,7 @@ def chunk_pages_by_section(
     # ---------------------------------------------------------
     # 2. Define heading patterns.
     # ---------------------------------------------------------
+
     heading_pattern = re.compile(
         r"^\s*(?:\d+\s+|\d+(?:\.\d+)+\s+)"
         r"[A-Z][A-Za-z0-9][A-Za-z0-9 /&()'’.,:–—\-]*\s*$"
@@ -323,6 +355,7 @@ def chunk_pages_by_section(
     # ---------------------------------------------------------
     # 3. Build sections with word-to-page mapping.
     # ---------------------------------------------------------
+
     sections = []
 
     current_section = {
@@ -335,6 +368,7 @@ def chunk_pages_by_section(
 
     def finish_paragraph():
         """Save paragraph text and the page number of each word."""
+
         nonlocal paragraph_lines
 
         if not paragraph_lines:
@@ -360,6 +394,7 @@ def chunk_pages_by_section(
 
     def finish_section():
         """Finish and save the current section."""
+
         finish_paragraph()
 
         if current_section["heading"] or current_section["paragraphs"]:
@@ -408,6 +443,7 @@ def chunk_pages_by_section(
     # ---------------------------------------------------------
     # 4. Convert sections into chunks.
     # ---------------------------------------------------------
+
     chunks: list[Chunk] = []
 
     for section in sections:
@@ -444,22 +480,27 @@ def chunk_pages_by_section(
         # Keep heading-only sections as valid chunks.
         if not words:
             if heading:
+                chunk_index = len(chunks)
+
                 chunks.append(
                     Chunk(
                         chunk_id=generate_chunk_id(
-                            document_id,
-                            len(chunks),
-                            heading,
+                            tenant_id=tenant_id,
+                            document_id=document_id,
+                            chunk_index=chunk_index,
+                            chunk_text=heading,
                         ),
+                        tenant_id=tenant_id,
                         document_id=document_id,
                         filename=filename,
-                        chunk_index=len(chunks),
+                        chunk_index=chunk_index,
                         text=heading,
                         start_page=heading_page,
                         end_page=heading_page,
                         source_pages=[heading_page],
                     )
                 )
+
             continue
 
         body_limit = chunk_size - len(heading_words)
@@ -499,16 +540,20 @@ def chunk_pages_by_section(
                 if page_number not in source_pages:
                     source_pages.append(page_number)
 
+            chunk_index = len(chunks)
+
             chunks.append(
                 Chunk(
                     chunk_id=generate_chunk_id(
-                        document_id,
-                        len(chunks),
-                        chunk_text,
+                        tenant_id=tenant_id,
+                        document_id=document_id,
+                        chunk_index=chunk_index,
+                        chunk_text=chunk_text,
                     ),
+                    tenant_id=tenant_id,
                     document_id=document_id,
                     filename=filename,
-                    chunk_index=len(chunks),
+                    chunk_index=chunk_index,
                     text=chunk_text,
                     start_page=min(source_pages),
                     end_page=max(source_pages),

@@ -10,3 +10,5 @@ rank-bm25==0.2.2
 fastapi>=0.115,<1
 uvicorn[standard]>=0.34,<1
 httpx==0.28.1
+PyJWT==2.15.1
+pwdlib==0.3.1

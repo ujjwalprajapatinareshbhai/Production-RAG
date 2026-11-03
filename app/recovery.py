@@ -1,4 +1,4 @@
-from app.bm25_retriever import refresh_bm25_index
+from app.bm25_retriever import refresh_all_bm25_indexes
 from app.registry import (
     claim_pending_cleanup_documents,
     mark_document_cleanup_completed,
@@ -39,7 +39,7 @@ def recover_stale_documents(
     )
 
     # Step 2: Atomically claim a batch of pending cleanup tasks.
-    # Each claimed document receives a new UUID fencing token.
+    # Each claimed document includes its tenant_id and fencing token.
     claimed_documents = claim_pending_cleanup_documents(
         limit=batch_size,
         lease_minutes=lease_minutes,
@@ -50,12 +50,16 @@ def recover_stale_documents(
 
     # Step 3: Process each claimed cleanup task.
     for document in claimed_documents:
+        tenant_id = document["tenant_id"]
         document_id = document["document_id"]
         claim_token = document["cleanup_claim_token"]
 
-        # Step 3A: Delete vectors from Qdrant.
+        # Step 3A: Delete only this tenant's vectors from Qdrant.
         try:
-            delete_document_chunks(document_id)
+            delete_document_chunks(
+                tenant_id,
+                document_id,
+            )
 
         except Exception as exc:
             error_message = f"{type(exc).__name__}: {exc}"
@@ -63,6 +67,7 @@ def recover_stale_documents(
             # Record failure only if this worker still owns
             # the cleanup lease.
             updated_document = mark_document_cleanup_failed(
+                tenant_id,
                 document_id,
                 error_message,
                 claim_token,
@@ -73,11 +78,13 @@ def recover_stale_documents(
                     "Cleanup failed, but the registry rejected "
                     "the failure update because the document "
                     "disappeared or this worker no longer owns "
-                    f"the cleanup lease: {document_id}"
+                    "the cleanup lease: "
+                    f"{tenant_id}/{document_id}"
                 ) from exc
 
             failed_documents.append(
                 {
+                    "tenant_id": str(tenant_id),
                     "document_id": document_id,
                     "error": error_message,
                 }
@@ -90,6 +97,7 @@ def recover_stale_documents(
         # Mark cleanup completed only if this worker still
         # owns the cleanup lease.
         updated_document = mark_document_cleanup_completed(
+            tenant_id,
             document_id,
             claim_token,
         )
@@ -98,18 +106,24 @@ def recover_stale_documents(
             raise RuntimeError(
                 "Cleanup completion rejected because the "
                 "document disappeared or this worker no longer "
-                f"owns the cleanup lease: {document_id}"
+                "owns the cleanup lease: "
+                f"{tenant_id}/{document_id}"
             )
 
-        cleaned_documents.append(document_id)
+        cleaned_documents.append(
+            {
+                "tenant_id": str(tenant_id),
+                "document_id": document_id,
+            }
+        )
 
-    # Step 4: Refresh BM25 if document visibility changed or
-    # at least one Qdrant cleanup succeeded.
+    # Step 4: Refresh all existing tenant BM25 caches if
+    # document visibility changed or Qdrant cleanup succeeded.
     bm25_refresh_error = None
 
     if stale_documents or cleaned_documents:
         try:
-            refresh_bm25_index()
+            refresh_all_bm25_indexes()
 
         except Exception as exc:
             bm25_refresh_error = f"{type(exc).__name__}: {exc}"
@@ -119,7 +133,7 @@ def recover_stale_documents(
         "cleanup_tasks_claimed": len(claimed_documents),
         "cleanup_completed": len(cleaned_documents),
         "cleanup_failed": len(failed_documents),
-        "cleaned_document_ids": cleaned_documents,
+        "cleaned_documents": cleaned_documents,
         "failed_documents": failed_documents,
         "bm25_refreshed": (
             bm25_refresh_error is None

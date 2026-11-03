@@ -1,3 +1,5 @@
+from uuid import UUID
+
 from app.context_selector import (
     classify_query_intent,
     select_context,
@@ -11,13 +13,17 @@ OVERVIEW_CANDIDATE_LIMIT = 60
 
 
 def search_documents(
+    tenant_id: UUID,
     query: str,
     limit: int = 3,
     candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
     document_id: str | None = None,
     collection_name: str | None = None,
 ) -> list[dict]:
-    """Retrieve, rerank, and select context using query intent."""
+    """Retrieve, rerank, and select context within one tenant."""
+
+    if not isinstance(tenant_id, UUID):
+        raise ValueError("tenant_id must be a UUID.")
 
     if not query or not query.strip():
         raise ValueError("Search query cannot be empty.")
@@ -38,6 +44,7 @@ def search_documents(
         )
 
     retrieval_kwargs = {
+        "tenant_id": tenant_id,
         "query": query,
         "limit": retrieval_limit,
         "candidate_limit": retrieval_limit,

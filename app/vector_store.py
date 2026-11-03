@@ -1,6 +1,7 @@
 import os
 import uuid
 from collections.abc import Sequence
+from uuid import UUID
 
 from fastembed import SparseTextEmbedding
 from qdrant_client import QdrantClient, models
@@ -48,6 +49,7 @@ def _build_payload(chunk: Chunk) -> dict:
     """Build the metadata stored alongside a chunk's vectors."""
     return {
         "chunk_id": chunk.chunk_id,
+        "tenant_id": str(chunk.tenant_id),
         "document_id": chunk.document_id,
         "filename": chunk.filename,
         "chunk_index": chunk.chunk_index,
@@ -137,8 +139,15 @@ def upsert_chunks(
 
     return stored_count
 
-def delete_document_chunks(document_id: str) -> None:
-    """Delete all Qdrant chunks belonging to a document."""
+
+def delete_document_chunks(
+    tenant_id: UUID,
+    document_id: str,
+) -> None:
+    """Delete document chunks belonging to a specific tenant."""
+
+    if not isinstance(tenant_id, UUID):
+        raise ValueError("tenant_id must be a UUID.")
 
     if not document_id or len(document_id) != 64:
         raise ValueError(
@@ -154,9 +163,17 @@ def delete_document_chunks(document_id: str) -> None:
             filter=models.Filter(
                 must=[
                     models.FieldCondition(
+                        key="tenant_id",
+                        match=models.MatchValue(
+                            value=str(tenant_id),
+                        ),
+                    ),
+                    models.FieldCondition(
                         key="document_id",
-                        match=models.MatchValue(value=document_id),
-                    )
+                        match=models.MatchValue(
+                            value=document_id,
+                        ),
+                    ),
                 ]
             )
         ),

@@ -5,15 +5,20 @@ from app import recovery
 
 
 def test_recover_stale_documents_successfully(monkeypatch):
+    tenant_id = uuid4()
     document_id = "a" * 64
     claim_token = uuid4()
 
     stale_documents = [
-        {"document_id": document_id},
+        {
+            "tenant_id": tenant_id,
+            "document_id": document_id,
+        },
     ]
 
     claimed_documents = [
         {
+            "tenant_id": tenant_id,
             "document_id": document_id,
             "cleanup_claim_token": claim_token,
         },
@@ -35,8 +40,10 @@ def test_recover_stale_documents_successfully(monkeypatch):
         lambda limit, lease_minutes: claimed_documents,
     )
 
-    def mock_delete(received_document_id):
-        deleted_ids.append(received_document_id)
+    def mock_delete(received_tenant_id, received_document_id):
+        deleted_ids.append(
+            (received_tenant_id, received_document_id)
+        )
 
     monkeypatch.setattr(
         recovery,
@@ -44,9 +51,17 @@ def test_recover_stale_documents_successfully(monkeypatch):
         mock_delete,
     )
 
-    def mock_completed(received_document_id, received_claim_token):
+    def mock_completed(
+        received_tenant_id,
+        received_document_id,
+        received_claim_token,
+    ):
         completed_updates.append(
-            (received_document_id, received_claim_token)
+            (
+                received_tenant_id,
+                received_document_id,
+                received_claim_token,
+            )
         )
         return {"document_id": received_document_id}
 
@@ -58,7 +73,7 @@ def test_recover_stale_documents_successfully(monkeypatch):
 
     monkeypatch.setattr(
         recovery,
-        "refresh_bm25_index",
+        "refresh_all_bm25_indexes",
         lambda: refreshed.append(True),
     )
 
@@ -69,14 +84,23 @@ def test_recover_stale_documents_successfully(monkeypatch):
     assert result["cleanup_completed"] == 1
     assert result["cleanup_failed"] == 0
 
-    assert deleted_ids == [document_id]
+    assert deleted_ids == [
+        (tenant_id, document_id)
+    ]
+
     assert completed_updates == [
-        (document_id, claim_token)
+        (tenant_id, document_id, claim_token)
     ]
 
     assert refreshed == [True]
 
-    assert result["cleaned_document_ids"] == [document_id]
+    assert result["cleaned_documents"] == [
+        {
+            "tenant_id": str(tenant_id),
+            "document_id": document_id,
+        }
+    ]
+
     assert result["bm25_refreshed"] is True
     assert result["bm25_refresh_error"] is None
 
@@ -84,6 +108,7 @@ def test_recover_stale_documents_successfully(monkeypatch):
 def test_recover_stale_documents_handles_qdrant_failure(
     monkeypatch,
 ):
+    tenant_id = uuid4()
     document_id = "b" * 64
     claim_token = uuid4()
 
@@ -98,13 +123,16 @@ def test_recover_stale_documents_handles_qdrant_failure(
         "claim_pending_cleanup_documents",
         lambda limit, lease_minutes: [
             {
+                "tenant_id": tenant_id,
                 "document_id": document_id,
                 "cleanup_claim_token": claim_token,
             }
         ],
     )
 
-    def mock_delete(received_document_id):
+    def mock_delete(received_tenant_id, received_document_id):
+        assert received_tenant_id == tenant_id
+        assert received_document_id == document_id
         raise ConnectionError("Qdrant connection failed.")
 
     monkeypatch.setattr(
@@ -116,12 +144,14 @@ def test_recover_stale_documents_handles_qdrant_failure(
     failed_updates = []
 
     def mock_failed(
+        received_tenant_id,
         received_document_id,
         error_message,
         received_claim_token,
     ):
         failed_updates.append(
             (
+                received_tenant_id,
                 received_document_id,
                 error_message,
                 received_claim_token,
@@ -144,7 +174,7 @@ def test_recover_stale_documents_handles_qdrant_failure(
 
     monkeypatch.setattr(
         recovery,
-        "refresh_bm25_index",
+        "refresh_all_bm25_indexes",
         lambda: refreshed.append(True),
     )
 
@@ -156,14 +186,19 @@ def test_recover_stale_documents_handles_qdrant_failure(
 
     assert len(failed_updates) == 1
 
-    failed_document_id, error_message, received_token = (
-        failed_updates[0]
-    )
+    (
+        failed_tenant_id,
+        failed_document_id,
+        error_message,
+        received_token,
+    ) = failed_updates[0]
 
+    assert failed_tenant_id == tenant_id
     assert failed_document_id == document_id
     assert "Qdrant connection failed" in error_message
     assert received_token == claim_token
 
+    assert result["failed_documents"][0]["tenant_id"] == str(tenant_id)
     assert result["failed_documents"][0]["document_id"] == document_id
     assert "Qdrant connection failed" in result["failed_documents"][0]["error"]
 
@@ -176,6 +211,7 @@ def test_recover_stale_documents_handles_qdrant_failure(
 def test_recover_stale_documents_handles_bm25_refresh_failure(
     monkeypatch,
 ):
+    tenant_id = uuid4()
     document_id = "c" * 64
     claim_token = uuid4()
 
@@ -190,6 +226,7 @@ def test_recover_stale_documents_handles_bm25_refresh_failure(
         "claim_pending_cleanup_documents",
         lambda limit, lease_minutes: [
             {
+                "tenant_id": tenant_id,
                 "document_id": document_id,
                 "cleanup_claim_token": claim_token,
             }
@@ -199,14 +236,22 @@ def test_recover_stale_documents_handles_bm25_refresh_failure(
     monkeypatch.setattr(
         recovery,
         "delete_document_chunks",
-        lambda received_document_id: None,
+        lambda received_tenant_id, received_document_id: None,
     )
 
     completed_updates = []
 
-    def mock_completed(received_document_id, received_claim_token):
+    def mock_completed(
+        received_tenant_id,
+        received_document_id,
+        received_claim_token,
+    ):
         completed_updates.append(
-            (received_document_id, received_claim_token)
+            (
+                received_tenant_id,
+                received_document_id,
+                received_claim_token,
+            )
         )
         return {"document_id": received_document_id}
 
@@ -221,7 +266,7 @@ def test_recover_stale_documents_handles_bm25_refresh_failure(
 
     monkeypatch.setattr(
         recovery,
-        "refresh_bm25_index",
+        "refresh_all_bm25_indexes",
         mock_refresh,
     )
 
@@ -229,10 +274,16 @@ def test_recover_stale_documents_handles_bm25_refresh_failure(
 
     # Qdrant cleanup remains successful.
     assert completed_updates == [
-        (document_id, claim_token)
+        (tenant_id, document_id, claim_token)
     ]
 
-    assert result["cleaned_document_ids"] == [document_id]
+    assert result["cleaned_documents"] == [
+        {
+            "tenant_id": str(tenant_id),
+            "document_id": document_id,
+        }
+    ]
+
     assert result["cleanup_completed"] == 1
     assert result["cleanup_failed"] == 0
 
@@ -244,11 +295,16 @@ def test_recover_stale_documents_handles_bm25_refresh_failure(
 def test_recover_stale_documents_refreshes_bm25_when_stale_documents_found(
     monkeypatch,
 ):
+    tenant_id = uuid4()
+
     monkeypatch.setattr(
         recovery,
         "mark_stale_documents_failed",
         lambda stale_after_minutes: [
-            {"document_id": "d" * 64}
+            {
+                "tenant_id": tenant_id,
+                "document_id": "d" * 64,
+            }
         ],
     )
 
@@ -262,7 +318,7 @@ def test_recover_stale_documents_refreshes_bm25_when_stale_documents_found(
 
     monkeypatch.setattr(
         recovery,
-        "refresh_bm25_index",
+        "refresh_all_bm25_indexes",
         lambda: refreshed.append(True),
     )
 
@@ -293,7 +349,7 @@ def test_recover_stale_documents_does_not_refresh_when_nothing_changed(
 
     monkeypatch.setattr(
         recovery,
-        "refresh_bm25_index",
+        "refresh_all_bm25_indexes",
         lambda: refreshed.append(True),
     )
 
@@ -336,7 +392,7 @@ def test_recover_stale_documents_passes_configuration(
 
     monkeypatch.setattr(
         recovery,
-        "refresh_bm25_index",
+        "refresh_all_bm25_indexes",
         lambda: None,
     )
 
@@ -377,9 +433,11 @@ def test_recover_stale_documents_rejects_invalid_arguments(
     with pytest.raises(ValueError, match=error_message):
         recovery.recover_stale_documents(**kwargs)
 
+
 def test_recovery_rejects_completion_when_lease_is_lost(
     monkeypatch,
 ):
+    tenant_id = uuid4()
     document_id = "e" * 64
     claim_token = uuid4()
 
@@ -397,6 +455,7 @@ def test_recovery_rejects_completion_when_lease_is_lost(
         "claim_pending_cleanup_documents",
         lambda limit, lease_minutes: [
             {
+                "tenant_id": tenant_id,
                 "document_id": document_id,
                 "cleanup_claim_token": claim_token,
             }
@@ -406,7 +465,9 @@ def test_recovery_rejects_completion_when_lease_is_lost(
     monkeypatch.setattr(
         recovery,
         "delete_document_chunks",
-        lambda received_id: deleted_ids.append(received_id),
+        lambda received_tenant_id, received_id: deleted_ids.append(
+            (received_tenant_id, received_id)
+        ),
     )
 
     # Simulate another worker reclaiming the task.
@@ -414,10 +475,15 @@ def test_recovery_rejects_completion_when_lease_is_lost(
     monkeypatch.setattr(
         recovery,
         "mark_document_cleanup_completed",
-        lambda received_id, received_token: None,
+        lambda received_tenant_id, received_id, received_token: None,
     )
 
-    def mock_failed(received_id, error_message, received_token):
+    def mock_failed(
+        received_tenant_id,
+        received_id,
+        error_message,
+        received_token,
+    ):
         failed_updates.append(received_id)
         return {"document_id": received_id}
 
@@ -433,15 +499,19 @@ def test_recovery_rejects_completion_when_lease_is_lost(
     ):
         recovery.recover_stale_documents()
 
-    assert deleted_ids == [document_id]
+    assert deleted_ids == [
+        (tenant_id, document_id)
+    ]
 
     # The code must not try to mark the task failed after
     # the completion update has already been rejected.
     assert failed_updates == []
 
+
 def test_recovery_rejects_failure_update_when_lease_is_lost(
     monkeypatch,
 ):
+    tenant_id = uuid4()
     document_id = "f" * 64
     claim_token = uuid4()
 
@@ -458,13 +528,14 @@ def test_recovery_rejects_failure_update_when_lease_is_lost(
         "claim_pending_cleanup_documents",
         lambda limit, lease_minutes: [
             {
+                "tenant_id": tenant_id,
                 "document_id": document_id,
                 "cleanup_claim_token": claim_token,
             }
         ],
     )
 
-    def mock_delete(received_id):
+    def mock_delete(received_tenant_id, received_id):
         raise ConnectionError("Qdrant connection failed.")
 
     monkeypatch.setattr(
@@ -478,10 +549,14 @@ def test_recovery_rejects_failure_update_when_lease_is_lost(
     monkeypatch.setattr(
         recovery,
         "mark_document_cleanup_failed",
-        lambda received_id, error_message, received_token: None,
+        lambda received_tenant_id, received_id, error_message, received_token: None,
     )
 
-    def mock_completed(received_id, received_token):
+    def mock_completed(
+        received_tenant_id,
+        received_id,
+        received_token,
+    ):
         completed_updates.append(received_id)
         return {"document_id": received_id}
 

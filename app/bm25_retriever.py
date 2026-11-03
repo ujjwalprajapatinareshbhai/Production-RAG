@@ -1,7 +1,9 @@
 import re
 from threading import RLock
+from uuid import UUID
 
 from rank_bm25 import BM25Okapi
+from qdrant_client import models
 
 from app.registry import list_completed_document_ids
 from app.vector_store import COLLECTION_NAME, get_vector_client
@@ -12,9 +14,15 @@ def tokenize(text: str) -> list[str]:
     return re.findall(r"\b\w+\b", text.lower())
 
 
-def load_chunks_from_qdrant() -> list[dict]:
-    """Load chunks belonging only to completed documents."""
-    completed_ids = set(list_completed_document_ids())
+def load_chunks_from_qdrant(tenant_id: UUID) -> list[dict]:
+    """Load completed-document chunks belonging to one tenant."""
+
+    if not isinstance(tenant_id, UUID):
+        raise ValueError("tenant_id must be a UUID.")
+
+    completed_ids = set(
+        list_completed_document_ids(tenant_id)
+    )
 
     if not completed_ids:
         return []
@@ -23,9 +31,22 @@ def load_chunks_from_qdrant() -> list[dict]:
     chunks = []
     offset = None
 
+    # Restrict Qdrant scrolling to the requested tenant.
+    tenant_filter = models.Filter(
+        must=[
+            models.FieldCondition(
+                key="tenant_id",
+                match=models.MatchValue(
+                    value=str(tenant_id)
+                ),
+            )
+        ]
+    )
+
     while True:
         response, next_offset = client.scroll(
             collection_name=COLLECTION_NAME,
+            scroll_filter=tenant_filter,
             limit=256,
             offset=offset,
             with_payload=True,
@@ -34,9 +55,11 @@ def load_chunks_from_qdrant() -> list[dict]:
 
         for point in response:
             payload = point.payload or {}
+
             document_id = payload.get("document_id")
             text = payload.get("text", "")
 
+            # Only include completed documents for this tenant.
             if document_id not in completed_ids:
                 continue
 
@@ -46,6 +69,7 @@ def load_chunks_from_qdrant() -> list[dict]:
             chunks.append(
                 {
                     "chunk_id": payload.get("chunk_id"),
+                    "tenant_id": payload.get("tenant_id"),
                     "document_id": document_id,
                     "filename": payload.get("filename"),
                     "text": text,
@@ -63,55 +87,109 @@ def load_chunks_from_qdrant() -> list[dict]:
     return chunks
 
 
-# In-memory BM25 cache. It lasts for the lifetime of this Python process.
+class TenantBM25Cache:
+    """Hold an independent BM25 index for one tenant."""
+
+    def __init__(self):
+        self.document_ids: tuple[str, ...] | None = None
+        self.chunks: list[dict] = []
+        self.tokenized_chunks: list[list[str]] = []
+        self.bm25: BM25Okapi | None = None
+        self.dirty = True
+
+
+# Each tenant receives an independent cache.
 _bm25_lock = RLock()
-_cached_document_ids: tuple[str, ...] | None = None
-_cached_chunks: list[dict] = []
-_cached_tokenized_chunks: list[list[str]] = []
-_cached_bm25: BM25Okapi | None = None
-_bm25_cache_dirty = True
+_bm25_caches: dict[UUID, TenantBM25Cache] = {}
 
 
-def _build_index(chunks: list[dict]) -> None:
-    """Build the BM25 index from a list of document chunks."""
-    global _cached_chunks
-    global _cached_tokenized_chunks
-    global _cached_bm25
+def _get_tenant_cache(tenant_id: UUID) -> TenantBM25Cache:
+    """Get or create the BM25 cache for a tenant."""
 
-    _cached_chunks = chunks
-    _cached_tokenized_chunks = [
-        tokenize(chunk["text"]) for chunk in chunks
-    ]
-
-    if _cached_tokenized_chunks and any(_cached_tokenized_chunks):
-        _cached_bm25 = BM25Okapi(_cached_tokenized_chunks)
-    else:
-        _cached_bm25 = None
-
-
-def refresh_bm25_index() -> None:
-    """Reload completed-document chunks and rebuild the BM25 index."""
-    global _cached_document_ids
-    global _bm25_cache_dirty
+    if not isinstance(tenant_id, UUID):
+        raise ValueError("tenant_id must be a UUID.")
 
     with _bm25_lock:
-        # Assume the cache is unsafe until refresh completes successfully.
-        _bm25_cache_dirty = True
+        if tenant_id not in _bm25_caches:
+            _bm25_caches[tenant_id] = TenantBM25Cache()
 
-        completed_ids = tuple(sorted(list_completed_document_ids()))
-        chunks = load_chunks_from_qdrant()
-
-        _build_index(chunks)
-        _cached_document_ids = completed_ids
-
-        # Mark the cache clean only after all refresh steps succeed.
-        _bm25_cache_dirty = False
+        return _bm25_caches[tenant_id]
 
 
-def search_bm25(query: str, limit: int = 3) -> list[dict]:
-    """Search completed-document chunks using a cached BM25 index."""
-    global _cached_document_ids
-    global _bm25_cache_dirty
+def _build_index(
+    cache: TenantBM25Cache,
+    chunks: list[dict],
+) -> None:
+    """Build one tenant's BM25 index."""
+
+    tokenized_chunks = [
+        tokenize(chunk["text"])
+        for chunk in chunks
+    ]
+
+    if tokenized_chunks and any(tokenized_chunks):
+        bm25 = BM25Okapi(tokenized_chunks)
+    else:
+        bm25 = None
+
+    # Replace cache contents only after the new index is built.
+    cache.chunks = chunks
+    cache.tokenized_chunks = tokenized_chunks
+    cache.bm25 = bm25
+
+
+def refresh_bm25_index(tenant_id: UUID) -> None:
+    """Reload completed-document chunks and rebuild one tenant's index."""
+
+    cache = _get_tenant_cache(tenant_id)
+
+    with _bm25_lock:
+        # Assume the cache is unsafe until refresh succeeds.
+        cache.dirty = True
+
+        completed_ids = tuple(
+            sorted(list_completed_document_ids(tenant_id))
+        )
+
+        chunks = load_chunks_from_qdrant(tenant_id)
+
+        _build_index(cache, chunks)
+        cache.document_ids = completed_ids
+
+        # Mark clean only after all refresh steps succeed.
+        cache.dirty = False
+
+
+def refresh_all_bm25_indexes() -> None:
+    """Mark every existing tenant cache dirty.
+
+    System-wide recovery can call this after deleting stale
+    document chunks. Each cache will rebuild on its next search.
+    """
+
+    with _bm25_lock:
+        for cache in _bm25_caches.values():
+            cache.dirty = True
+
+
+def invalidate_bm25_index(tenant_id: UUID) -> None:
+    """Mark one tenant's BM25 index dirty."""
+
+    cache = _get_tenant_cache(tenant_id)
+
+    with _bm25_lock:
+        cache.dirty = True
+
+
+def search_bm25(
+    tenant_id: UUID,
+    query: str,
+    limit: int = 3,
+) -> list[dict]:
+    """Search completed-document chunks using one tenant's BM25 index."""
+
+    if not isinstance(tenant_id, UUID):
+        raise ValueError("tenant_id must be a UUID.")
 
     if not query or not query.strip():
         raise ValueError("Search query cannot be empty.")
@@ -124,41 +202,53 @@ def search_bm25(query: str, limit: int = 3) -> list[dict]:
     if not query_tokens:
         return []
 
+    cache = _get_tenant_cache(tenant_id)
+
     with _bm25_lock:
-        completed_ids = tuple(sorted(list_completed_document_ids()))
+        completed_ids = tuple(
+            sorted(list_completed_document_ids(tenant_id))
+        )
 
-        # Rebuild if the cache is dirty or the document set has changed.
+        # Rebuild if the cache is dirty or the document set changed.
         if (
-            _bm25_cache_dirty
-            or completed_ids != _cached_document_ids
+            cache.dirty
+            or completed_ids != cache.document_ids
         ):
-            _bm25_cache_dirty = True
+            cache.dirty = True
 
-            chunks = load_chunks_from_qdrant()
-            _build_index(chunks)
-            _cached_document_ids = completed_ids
+            chunks = load_chunks_from_qdrant(tenant_id)
+
+            _build_index(cache, chunks)
+            cache.document_ids = completed_ids
 
             # Mark clean only after a successful rebuild.
-            _bm25_cache_dirty = False
+            cache.dirty = False
 
-        if not _cached_chunks or _cached_bm25 is None:
+        if not cache.chunks or cache.bm25 is None:
             return []
 
-        scores = _cached_bm25.get_scores(query_tokens)
+        scores = cache.bm25.get_scores(query_tokens)
 
         ranked_indices = sorted(
-            range(len(_cached_chunks)),
+            range(len(cache.chunks)),
             key=lambda index: scores[index],
             reverse=True,
         )
 
         results = []
+        query_token_set = set(query_tokens)
 
         for index in ranked_indices:
-            if scores[index] <= 0:
-                break
+            document_tokens = set(
+                cache.tokenized_chunks[index]
+            )
 
-            result = _cached_chunks[index].copy()
+            # Only return documents that actually match
+            # at least one query token.
+            if not query_token_set.intersection(document_tokens):
+                continue
+
+            result = cache.chunks[index].copy()
             result["score"] = float(scores[index])
             results.append(result)
 

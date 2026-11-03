@@ -1,7 +1,11 @@
 import pytest
+from uuid import UUID
 
 from app.models import Chunk
 import app.ingestion as ingestion
+
+
+TEST_TENANT_ID = UUID("22222222-2222-2222-2222-222222222222")
 
 
 @pytest.fixture(autouse=True)
@@ -9,16 +13,14 @@ def mock_vector_cleanup(monkeypatch):
     monkeypatch.setattr(
         ingestion,
         "delete_document_chunks",
-        lambda document_id: None,
-        raising=False,
+        lambda tenant_id, document_id: None,
     )
 
     # Keep heartbeat successful by default in ingestion unit tests.
     monkeypatch.setattr(
         ingestion,
         "update_document_heartbeat",
-        lambda document_id: True,
-        raising=False,
+        lambda tenant_id, document_id: True,
     )
 
 
@@ -27,6 +29,7 @@ def sample_chunks():
     return [
         Chunk(
             chunk_id="chunk-1",
+            tenant_id=TEST_TENANT_ID,
             document_id="a" * 64,
             filename="sample.pdf",
             chunk_index=0,
@@ -37,6 +40,7 @@ def sample_chunks():
         ),
         Chunk(
             chunk_id="chunk-2",
+            tenant_id=TEST_TENANT_ID,
             document_id="a" * 64,
             filename="sample.pdf",
             chunk_index=1,
@@ -64,7 +68,7 @@ def test_ingestion_success(monkeypatch, sample_chunks):
     monkeypatch.setattr(
         ingestion,
         "update_document_status",
-        lambda doc_id, status, **kwargs: status_updates.append(
+        lambda tenant_id, doc_id, status, **kwargs: status_updates.append(
             (status, kwargs.get("error_message"))
         ),
     )
@@ -74,8 +78,12 @@ def test_ingestion_success(monkeypatch, sample_chunks):
         lambda chunks: len(chunks),
     )
 
-    result = ingestion.ingest_document("sample.pdf")
+    result = ingestion.ingest_document(
+        "sample.pdf",
+        tenant_id=TEST_TENANT_ID,
+    )
 
+    assert result["tenant_id"] == str(TEST_TENANT_ID)
     assert result["status"] == "completed"
     assert result["chunks_prepared"] == 2
     assert result["chunks_stored"] == 2
@@ -104,7 +112,7 @@ def test_ingestion_failure_marks_document_failed(
     monkeypatch.setattr(
         ingestion,
         "update_document_status",
-        lambda doc_id, status, **kwargs: status_updates.append(
+        lambda tenant_id, doc_id, status, **kwargs: status_updates.append(
             (status, kwargs.get("error_message"))
         ),
     )
@@ -122,7 +130,10 @@ def test_ingestion_failure_marks_document_failed(
         RuntimeError,
         match="Qdrant storage failed",
     ):
-        ingestion.ingest_document("sample.pdf")
+        ingestion.ingest_document(
+            "sample.pdf",
+            tenant_id=TEST_TENANT_ID,
+        )
 
     assert status_updates[0] == ("processing", None)
     assert status_updates[1] == (
@@ -149,7 +160,7 @@ def test_ingestion_detects_chunk_count_mismatch(
     monkeypatch.setattr(
         ingestion,
         "update_document_status",
-        lambda doc_id, status, **kwargs: status_updates.append(
+        lambda tenant_id, doc_id, status, **kwargs: status_updates.append(
             (status, kwargs.get("error_message"))
         ),
     )
@@ -163,7 +174,10 @@ def test_ingestion_detects_chunk_count_mismatch(
         RuntimeError,
         match="Expected to store 2 chunks",
     ):
-        ingestion.ingest_document("sample.pdf")
+        ingestion.ingest_document(
+            "sample.pdf",
+            tenant_id=TEST_TENANT_ID,
+        )
 
     assert status_updates[-1][0] == "failed"
     assert "Expected to store 2 chunks" in status_updates[-1][1]
@@ -172,7 +186,7 @@ def test_ingestion_detects_chunk_count_mismatch(
 def test_ingestion_preserves_original_error_if_failure_update_fails(
     monkeypatch, sample_chunks
 ):
-    def update_status(doc_id, status, **kwargs):
+    def update_status(tenant_id, doc_id, status, **kwargs):
         if status == "completed":
             raise RuntimeError(
                 "Could not mark document completed"
@@ -208,7 +222,10 @@ def test_ingestion_preserves_original_error_if_failure_update_fails(
         RuntimeError,
         match="Could not mark document completed",
     ):
-        ingestion.ingest_document("sample.pdf")
+        ingestion.ingest_document(
+            "sample.pdf",
+            tenant_id=TEST_TENANT_ID,
+        )
 
 
 def test_ingestion_stops_if_processing_status_update_fails(
@@ -228,7 +245,9 @@ def test_ingestion_stops_if_processing_status_update_fails(
         lambda *args: None,
     )
 
-    def fail_processing_update(doc_id, status, **kwargs):
+    def fail_processing_update(
+        tenant_id, doc_id, status, **kwargs
+    ):
         status_updates.append(status)
 
         if status == "processing":
@@ -249,7 +268,10 @@ def test_ingestion_stops_if_processing_status_update_fails(
         RuntimeError,
         match="PostgreSQL unavailable",
     ):
-        ingestion.ingest_document("sample.pdf")
+        ingestion.ingest_document(
+            "sample.pdf",
+            tenant_id=TEST_TENANT_ID,
+        )
 
     assert status_updates == ["processing"]
     assert storage_calls == []
@@ -270,9 +292,9 @@ def test_ingestion_recovers_after_retry(monkeypatch, sample_chunks):
         lambda *args: None,
     )
 
-    def update_status(doc_id, status, **kwargs):
+    def update_status(tenant_id, doc_id, status, **kwargs):
         status_updates.append(
-            (doc_id, status, kwargs.get("error_message"))
+            (tenant_id, doc_id, status, kwargs.get("error_message"))
         )
 
     monkeypatch.setattr(
@@ -300,13 +322,20 @@ def test_ingestion_recovers_after_retry(monkeypatch, sample_chunks):
         RuntimeError,
         match="Temporary Qdrant failure",
     ):
-        ingestion.ingest_document("sample.pdf")
+        ingestion.ingest_document(
+            "sample.pdf",
+            tenant_id=TEST_TENANT_ID,
+        )
 
     # Attempt 2: retry succeeds.
-    result = ingestion.ingest_document("sample.pdf")
+    result = ingestion.ingest_document(
+        "sample.pdf",
+        tenant_id=TEST_TENANT_ID,
+    )
 
     expected_document_id = sample_chunks[0].document_id
 
+    assert result["tenant_id"] == str(TEST_TENANT_ID)
     assert result["document_id"] == expected_document_id
     assert result["status"] == "completed"
     assert result["chunks_prepared"] == 2
@@ -314,7 +343,7 @@ def test_ingestion_recovers_after_retry(monkeypatch, sample_chunks):
 
     assert len(storage_attempts) == 2
 
-    assert [status for _, status, _ in status_updates] == [
+    assert [status for _, _, status, _ in status_updates] == [
         "processing",
         "failed",
         "processing",
@@ -322,12 +351,17 @@ def test_ingestion_recovers_after_retry(monkeypatch, sample_chunks):
     ]
 
     assert all(
-        doc_id == expected_document_id
-        for doc_id, _, _ in status_updates
+        tenant_id == TEST_TENANT_ID
+        for tenant_id, _, _, _ in status_updates
     )
 
-    assert status_updates[1][2] == "Temporary Qdrant failure"
-    assert status_updates[3][2] is None
+    assert all(
+        doc_id == expected_document_id
+        for _, doc_id, _, _ in status_updates
+    )
+
+    assert status_updates[1][3] == "Temporary Qdrant failure"
+    assert status_updates[3][3] is None
 
 
 def test_ingestion_refreshes_bm25_index_after_success(
@@ -346,7 +380,7 @@ def test_ingestion_refreshes_bm25_index_after_success(
         lambda *args: events.append("registered"),
     )
 
-    def update_status(doc_id, status, **kwargs):
+    def update_status(tenant_id, doc_id, status, **kwargs):
         events.append(status)
 
     monkeypatch.setattr(
@@ -362,11 +396,13 @@ def test_ingestion_refreshes_bm25_index_after_success(
     monkeypatch.setattr(
         ingestion,
         "refresh_bm25_index",
-        lambda: events.append("bm25_refreshed"),
-        raising=False,
+        lambda tenant_id: events.append("bm25_refreshed"),
     )
 
-    result = ingestion.ingest_document("sample.pdf")
+    result = ingestion.ingest_document(
+        "sample.pdf",
+        tenant_id=TEST_TENANT_ID,
+    )
 
     assert result["status"] == "completed"
 
@@ -397,7 +433,7 @@ def test_ingestion_cleans_up_vectors_after_storage_failure(
     monkeypatch.setattr(
         ingestion,
         "update_document_status",
-        lambda doc_id, status, **kwargs: status_updates.append(
+        lambda tenant_id, doc_id, status, **kwargs: status_updates.append(
             status
         ),
     )
@@ -414,18 +450,24 @@ def test_ingestion_cleans_up_vectors_after_storage_failure(
     monkeypatch.setattr(
         ingestion,
         "delete_document_chunks",
-        lambda document_id: cleanup_calls.append(document_id),
-        raising=False,
+        lambda tenant_id, document_id: cleanup_calls.append(
+            (tenant_id, document_id)
+        ),
     )
 
     with pytest.raises(
         RuntimeError,
         match="Partial Qdrant write failure",
     ):
-        ingestion.ingest_document("sample.pdf")
+        ingestion.ingest_document(
+            "sample.pdf",
+            tenant_id=TEST_TENANT_ID,
+        )
 
     assert status_updates == ["processing", "failed"]
-    assert cleanup_calls == [sample_chunks[0].document_id]
+    assert cleanup_calls == [
+        (TEST_TENANT_ID, sample_chunks[0].document_id)
+    ]
 
 
 def test_ingestion_preserves_original_error_if_cleanup_fails(
@@ -444,7 +486,7 @@ def test_ingestion_preserves_original_error_if_cleanup_fails(
         lambda *args: None,
     )
 
-    def fake_update_status(doc_id, status, **kwargs):
+    def fake_update_status(tenant_id, doc_id, status, **kwargs):
         status_updates.append(status)
 
     monkeypatch.setattr(
@@ -456,7 +498,7 @@ def test_ingestion_preserves_original_error_if_cleanup_fails(
     def fail_storage(chunks):
         raise RuntimeError("Original Qdrant storage failure")
 
-    def fail_cleanup(document_id):
+    def fail_cleanup(tenant_id, document_id):
         raise RuntimeError("Qdrant cleanup failure")
 
     monkeypatch.setattr(
@@ -474,7 +516,10 @@ def test_ingestion_preserves_original_error_if_cleanup_fails(
         RuntimeError,
         match="Original Qdrant storage failure",
     ) as exc_info:
-        ingestion.ingest_document("sample.pdf")
+        ingestion.ingest_document(
+            "sample.pdf",
+            tenant_id=TEST_TENANT_ID,
+        )
 
     assert status_updates == ["processing", "failed"]
 
@@ -501,7 +546,9 @@ def test_ingestion_cleans_up_even_if_failed_status_update_fails(
         lambda *args: None,
     )
 
-    def fail_failed_status_update(doc_id, status, **kwargs):
+    def fail_failed_status_update(
+        tenant_id, doc_id, status, **kwargs
+    ):
         status_updates.append(status)
 
         if status == "failed":
@@ -526,22 +573,30 @@ def test_ingestion_cleans_up_even_if_failed_status_update_fails(
     monkeypatch.setattr(
         ingestion,
         "delete_document_chunks",
-        lambda document_id: cleanup_calls.append(document_id),
+        lambda tenant_id, document_id: cleanup_calls.append(
+            (tenant_id, document_id)
+        ),
     )
 
     with pytest.raises(
         RuntimeError,
         match="Original ingestion failure",
     ) as exc_info:
-        ingestion.ingest_document("sample.pdf")
+        ingestion.ingest_document(
+            "sample.pdf",
+            tenant_id=TEST_TENANT_ID,
+        )
 
     assert status_updates == ["processing", "failed"]
-    assert cleanup_calls == [sample_chunks[0].document_id]
+    assert cleanup_calls == [
+        (TEST_TENANT_ID, sample_chunks[0].document_id)
+    ]
 
     assert any(
         "PostgreSQL status update failed" in note
         for note in exc_info.value.__notes__
     )
+
 
 def test_ingestion_fails_if_heartbeat_update_fails(
     monkeypatch, sample_chunks
@@ -562,7 +617,7 @@ def test_ingestion_fails_if_heartbeat_update_fails(
     monkeypatch.setattr(
         ingestion,
         "update_document_status",
-        lambda doc_id, status, **kwargs: status_updates.append(
+        lambda tenant_id, doc_id, status, **kwargs: status_updates.append(
             (status, kwargs.get("error_message"))
         ),
     )
@@ -574,26 +629,34 @@ def test_ingestion_fails_if_heartbeat_update_fails(
     monkeypatch.setattr(
         ingestion,
         "update_document_heartbeat",
-        lambda document_id: False,
+        lambda tenant_id, document_id: False,
     )
     monkeypatch.setattr(
         ingestion,
         "delete_document_chunks",
-        lambda document_id: cleanup_calls.append(document_id),
+        lambda tenant_id, document_id: cleanup_calls.append(
+            (tenant_id, document_id)
+        ),
     )
 
     with pytest.raises(
         RuntimeError,
         match="Could not refresh heartbeat",
     ):
-        ingestion.ingest_document("sample.pdf")
+        ingestion.ingest_document(
+            "sample.pdf",
+            tenant_id=TEST_TENANT_ID,
+        )
 
     assert [status for status, _ in status_updates] == [
         "processing",
         "failed",
     ]
     assert "Could not refresh heartbeat" in status_updates[1][1]
-    assert cleanup_calls == [sample_chunks[0].document_id]
+    assert cleanup_calls == [
+        (TEST_TENANT_ID, sample_chunks[0].document_id)
+    ]
+
 
 def test_ingestion_refreshes_heartbeat_periodically(
     monkeypatch, sample_chunks
@@ -625,7 +688,8 @@ def test_ingestion_refreshes_heartbeat_periodically(
         lambda *args, **kwargs: None,
     )
 
-    def fake_heartbeat(document_id):
+    def fake_heartbeat(tenant_id, document_id):
+        assert tenant_id == TEST_TENANT_ID
         heartbeat_calls.append(document_id)
         return True
 
@@ -653,10 +717,13 @@ def test_ingestion_refreshes_heartbeat_periodically(
     monkeypatch.setattr(
         ingestion,
         "refresh_bm25_index",
-        lambda: None,
+        lambda tenant_id: None,
     )
 
-    result = ingestion.ingest_document("sample.pdf")
+    result = ingestion.ingest_document(
+        "sample.pdf",
+        tenant_id=TEST_TENANT_ID,
+    )
 
     assert result["status"] == "completed"
 

@@ -1,8 +1,11 @@
-
 from types import SimpleNamespace
+from uuid import uuid4
 
 import app.qdrant_hybrid_retriever as hybrid_module
 import app.retriever as dense_module
+
+
+TEST_TENANT_ID = uuid4()
 
 
 class FakeList(list):
@@ -27,7 +30,7 @@ def test_dense_retriever_filters_to_completed_documents(monkeypatch):
     monkeypatch.setattr(
         dense_module,
         "list_completed_document_ids",
-        lambda: ["completed-document"],
+        lambda tenant_id: ["completed-document"],
     )
     monkeypatch.setattr(
         dense_module,
@@ -40,41 +43,53 @@ def test_dense_retriever_filters_to_completed_documents(monkeypatch):
         lambda: client,
     )
 
-    results = dense_module.search_chunks("defect tracking")
+    results = dense_module.search_chunks(
+        tenant_id=TEST_TENANT_ID,
+        query="defect tracking",
+    )
 
     assert results == []
     assert len(client.calls) == 1
 
     query_filter = client.calls[0]["query_filter"]
-    condition = query_filter.must[0]
 
-    assert condition.key == "document_id"
-    assert condition.match.any == ["completed-document"]
+    # First condition must restrict results to the requested tenant.
+    assert query_filter.must[0].key == "tenant_id"
+    assert query_filter.must[0].match.value == str(TEST_TENANT_ID)
+
+    # Second condition must restrict results to completed documents.
+    assert query_filter.must[1].key == "document_id"
+    assert query_filter.must[1].match.any == ["completed-document"]
 
 
 def test_dense_retriever_skips_search_when_no_documents_completed(
     monkeypatch,
 ):
-    def unexpected_call():
-        raise AssertionError("Completed-document lookup should return empty.")
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError(
+            "Search should not execute when no documents are completed."
+        )
 
     monkeypatch.setattr(
         dense_module,
         "list_completed_document_ids",
-        lambda: [],
+        lambda tenant_id: [],
     )
     monkeypatch.setattr(
         dense_module,
         "embed_text",
-        lambda query: unexpected_call(),
+        unexpected_call,
     )
     monkeypatch.setattr(
         dense_module,
         "get_vector_client",
-        lambda: unexpected_call(),
+        unexpected_call,
     )
 
-    results = dense_module.search_chunks("defect tracking")
+    results = dense_module.search_chunks(
+        tenant_id=TEST_TENANT_ID,
+        query="defect tracking",
+    )
 
     assert results == []
 
@@ -94,7 +109,7 @@ def test_hybrid_retriever_filters_to_completed_documents(monkeypatch):
     monkeypatch.setattr(
         hybrid_module,
         "list_completed_document_ids",
-        lambda: ["completed-document"],
+        lambda tenant_id: ["completed-document"],
     )
     monkeypatch.setattr(
         hybrid_module,
@@ -112,7 +127,10 @@ def test_hybrid_retriever_filters_to_completed_documents(monkeypatch):
         lambda: client,
     )
 
-    results = hybrid_module.search_qdrant_hybrid("defect tracking")
+    results = hybrid_module.search_qdrant_hybrid(
+        tenant_id=TEST_TENANT_ID,
+        query="defect tracking",
+    )
 
     assert results == []
     assert len(client.calls) == 1
@@ -120,13 +138,23 @@ def test_hybrid_retriever_filters_to_completed_documents(monkeypatch):
     call = client.calls[0]
     query_filter = call["query_filter"]
 
-    assert query_filter.must[0].match.any == ["completed-document"]
+    # Final RRF query must enforce tenant isolation.
+    assert query_filter.must[0].key == "tenant_id"
+    assert query_filter.must[0].match.value == str(TEST_TENANT_ID)
+
+    # Final RRF query must include completed-document filtering.
+    assert query_filter.must[1].key == "document_id"
+    assert query_filter.must[1].match.any == ["completed-document"]
 
     # Both dense and sparse candidate searches must use the same filter.
     assert len(call["prefetch"]) == 2
 
     for prefetch in call["prefetch"]:
-        assert prefetch.filter.must[0].match.any == [
+        assert prefetch.filter.must[0].key == "tenant_id"
+        assert prefetch.filter.must[0].match.value == str(TEST_TENANT_ID)
+
+        assert prefetch.filter.must[1].key == "document_id"
+        assert prefetch.filter.must[1].match.any == [
             "completed-document"
         ]
 
@@ -134,25 +162,30 @@ def test_hybrid_retriever_filters_to_completed_documents(monkeypatch):
 def test_hybrid_retriever_skips_search_when_no_documents_completed(
     monkeypatch,
 ):
-    def unexpected_call():
-        raise AssertionError("Completed-document lookup should return empty.")
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError(
+            "Search should not execute when no documents are completed."
+        )
 
     monkeypatch.setattr(
         hybrid_module,
         "list_completed_document_ids",
-        lambda: [],
+        lambda tenant_id: [],
     )
     monkeypatch.setattr(
         hybrid_module,
         "embed_text",
-        lambda query: unexpected_call(),
+        unexpected_call,
     )
     monkeypatch.setattr(
         hybrid_module,
         "get_vector_client",
-        lambda: unexpected_call(),
+        unexpected_call,
     )
 
-    results = hybrid_module.search_qdrant_hybrid("defect tracking")
+    results = hybrid_module.search_qdrant_hybrid(
+        tenant_id=TEST_TENANT_ID,
+        query="defect tracking",
+    )
 
     assert results == []

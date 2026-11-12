@@ -1,10 +1,10 @@
 import uuid
 from datetime import datetime, timedelta, timezone
-
+from psycopg.errors import UniqueViolation
 import pytest
 
 from app.db import get_connection
-
+from app.auth import generate_invitation_token, hash_invitation_token
 from app.registry import (
     claim_pending_cleanup_documents,
     create_tenant,
@@ -19,6 +19,12 @@ from app.registry import (
     register_document,
     update_document_status,
     update_document_heartbeat,
+    create_invitation,
+    create_membership,
+    create_user,
+    get_active_membership,
+    get_user_by_id,
+    accept_invitation,
 )
 
 
@@ -1221,9 +1227,12 @@ def test_claim_pending_cleanup_documents_respects_limit(
             conn.execute(
                 """
                 UPDATE documents
-                SET cleanup_pending = TRUE
+                SET
+                    cleanup_pending = TRUE,
+                    cleanup_claimed_at = NULL,
+                    updated_at = NOW() - INTERVAL '1 day'
                 WHERE tenant_id = %s
-                  AND document_id IN (%s, %s)
+                   AND document_id IN (%s, %s)
                 """,
                 (tenant_id, first_id, second_id),
             )
@@ -1271,4 +1280,920 @@ def test_claim_pending_cleanup_documents_rejects_invalid_lease(
     ):
         claim_pending_cleanup_documents(
             lease_minutes=lease_minutes,
+        )
+
+@pytest.fixture
+def invitation_users(tenant):
+    """Create and clean up users for invitation tests."""
+
+    owner = create_user(
+        f"owner-{uuid.uuid4().hex}@example.com",
+        "test-password-hash",
+    )
+
+    admin = create_user(
+        f"admin-{uuid.uuid4().hex}@example.com",
+        "test-password-hash",
+    )
+
+    member = create_user(
+        f"member-{uuid.uuid4().hex}@example.com",
+        "test-password-hash",
+    )
+
+    users = {
+        "owner": owner,
+        "admin": admin,
+        "member": member,
+    }
+
+    for role, user in users.items():
+        create_membership(
+            tenant["tenant_id"],
+            user["user_id"],
+            role,
+        )
+
+    yield users
+
+    # Clean up invitations and memberships first.
+    with get_connection() as conn:
+        conn.execute(
+            """
+            DELETE FROM tenant_invitations
+            WHERE tenant_id = %s;
+            """,
+            (tenant["tenant_id"],),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM tenant_memberships
+            WHERE tenant_id = %s;
+            """,
+            (tenant["tenant_id"],),
+        )
+
+        # Users are independent accounts, so delete them explicitly.
+        for user in users.values():
+            conn.execute(
+                """
+                DELETE FROM users
+                WHERE user_id = %s;
+                """,
+                (user["user_id"],),
+            )
+
+@pytest.fixture
+def pending_invitation(invitation_users, tenant):
+    """Create a pending invitation for a new member."""
+
+    email = f"invitee-{uuid.uuid4().hex}@example.com"
+    token = generate_invitation_token()
+
+    invitation = create_invitation(
+        tenant_id=tenant["tenant_id"],
+        email=email,
+        role="member",
+        invited_by=invitation_users["owner"]["user_id"],
+        token_hash=hash_invitation_token(token),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+    )
+
+    return {
+        "email": email,
+        "token": token,
+        "token_hash": hash_invitation_token(token),
+        "invitation": invitation,
+    }
+
+
+@pytest.fixture
+def invited_user(pending_invitation):
+    """Create the user who was invited."""
+
+    user = create_user(
+        pending_invitation["email"],
+        "test-password-hash",
+    )
+
+    yield user
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            DELETE FROM tenant_memberships
+            WHERE user_id = %s;
+            """,
+            (user["user_id"],),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM users
+            WHERE user_id = %s;
+            """,
+            (user["user_id"],),
+        )
+
+# =========================================================
+# TENANT INVITATION PERMISSION TESTS
+# =========================================================
+
+def test_owner_can_invite_admin(invitation_users, tenant):
+    token = generate_invitation_token()
+
+    result = create_invitation(
+        tenant_id=tenant["tenant_id"],
+        email="new-admin@example.com",
+        role="admin",
+        invited_by=invitation_users["owner"]["user_id"],
+        token_hash=hash_invitation_token(token),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+    )
+
+    assert result["email"] == "new-admin@example.com"
+    assert result["role"] == "admin"
+    assert result["tenant_id"] == tenant["tenant_id"]
+    assert "token_hash" not in result
+
+
+def test_admin_can_invite_member(invitation_users, tenant):
+    token = generate_invitation_token()
+
+    result = create_invitation(
+        tenant_id=tenant["tenant_id"],
+        email="new-member@example.com",
+        role="member",
+        invited_by=invitation_users["admin"]["user_id"],
+        token_hash=hash_invitation_token(token),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+    )
+
+    assert result["email"] == "new-member@example.com"
+    assert result["role"] == "member"
+
+
+def test_admin_cannot_invite_admin(invitation_users, tenant):
+    token = generate_invitation_token()
+
+    with pytest.raises(
+        PermissionError,
+        match="Only owners can invite administrators",
+    ):
+        create_invitation(
+            tenant_id=tenant["tenant_id"],
+            email="another-admin@example.com",
+            role="admin",
+            invited_by=invitation_users["admin"]["user_id"],
+            token_hash=hash_invitation_token(token),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        )
+
+
+def test_member_cannot_invite_users(invitation_users, tenant):
+    token = generate_invitation_token()
+
+    with pytest.raises(
+        PermissionError,
+        match="Only owners and admins can invite users",
+    ):
+        create_invitation(
+            tenant_id=tenant["tenant_id"],
+            email="unauthorized@example.com",
+            role="member",
+            invited_by=invitation_users["member"]["user_id"],
+            token_hash=hash_invitation_token(token),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        )
+
+def test_duplicate_active_invitation_is_rejected(
+    invitation_users,
+    tenant,
+):
+    email = "duplicate@example.com"
+
+    create_invitation(
+        tenant_id=tenant["tenant_id"],
+        email=email,
+        role="member",
+        invited_by=invitation_users["owner"]["user_id"],
+        token_hash=hash_invitation_token(
+            generate_invitation_token()
+        ),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+    )
+
+    with pytest.raises(UniqueViolation):
+        create_invitation(
+            tenant_id=tenant["tenant_id"],
+            email=email,
+            role="member",
+            invited_by=invitation_users["owner"]["user_id"],
+            token_hash=hash_invitation_token(
+                generate_invitation_token()
+            ),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        )
+
+def test_expired_invitation_can_be_replaced(
+    invitation_users,
+    tenant,
+):
+    email = "expired-invitation@example.com"
+
+    first_invitation = create_invitation(
+        tenant_id=tenant["tenant_id"],
+        email=email,
+        role="member",
+        invited_by=invitation_users["owner"]["user_id"],
+        token_hash=hash_invitation_token(
+            generate_invitation_token()
+        ),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+    )
+
+    # Simulate expiration directly in the test database.
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE tenant_invitations
+            SET expires_at = NOW() - INTERVAL '1 hour'
+            WHERE invitation_id = %s;
+            """,
+            (first_invitation["invitation_id"],),
+        )
+
+    replacement = create_invitation(
+        tenant_id=tenant["tenant_id"],
+        email=email,
+        role="member",
+        invited_by=invitation_users["owner"]["user_id"],
+        token_hash=hash_invitation_token(
+            generate_invitation_token()
+        ),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+    )
+
+    assert replacement["invitation_id"] != first_invitation["invitation_id"]
+
+    # Confirm the expired invitation was revoked.
+    with get_connection() as conn:
+        old_invitation = conn.execute(
+            """
+            SELECT revoked_at
+            FROM tenant_invitations
+            WHERE invitation_id = %s;
+            """,
+            (first_invitation["invitation_id"],),
+        ).fetchone()
+
+    assert old_invitation[0] is not None
+
+def test_invitation_rejects_invalid_role(invitation_users, tenant):
+    with pytest.raises(
+        ValueError,
+        match="Invalid invitation role",
+    ):
+        create_invitation(
+            tenant_id=tenant["tenant_id"],
+            email="invalid-role@example.com",
+            role="owner",
+            invited_by=invitation_users["owner"]["user_id"],
+            token_hash=hash_invitation_token(
+                generate_invitation_token()
+            ),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+     )
+          
+def test_invitation_rejects_invalid_token_hash(invitation_users, tenant):
+    with pytest.raises(
+        ValueError,
+        match="Invalid invitation token hash",
+    ):
+        create_invitation(
+            tenant_id=tenant["tenant_id"],
+            email="invalid-token@example.com",
+            role="member",
+            invited_by=invitation_users["owner"]["user_id"],
+            token_hash="not-a-valid-hash",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        )
+
+def test_invitation_rejects_empty_email(invitation_users, tenant):
+    with pytest.raises(
+        ValueError,
+        match="Email cannot be empty",
+    ):
+        create_invitation(
+            tenant_id=tenant["tenant_id"],
+            email="   ",
+            role="member",
+            invited_by=invitation_users["owner"]["user_id"],
+            token_hash=hash_invitation_token(
+                generate_invitation_token()
+            ),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        )
+
+def test_invitation_rejects_past_expiry(invitation_users, tenant):
+    with pytest.raises(
+        ValueError,
+        match="Invitation expiry must be in the future",
+    ):
+        create_invitation(
+            tenant_id=tenant["tenant_id"],
+            email="past-expiry@example.com",
+            role="member",
+            invited_by=invitation_users["owner"]["user_id"],
+            token_hash=hash_invitation_token(
+                generate_invitation_token()
+            ),
+            expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        )
+
+def test_invitation_rejects_naive_expiry(invitation_users, tenant):
+    with pytest.raises(
+        ValueError,
+        match="Invitation expiry must be timezone-aware",
+    ):
+        create_invitation(
+            tenant_id=tenant["tenant_id"],
+            email="naive-expiry@example.com",
+            role="member",
+            invited_by=invitation_users["owner"]["user_id"],
+            token_hash=hash_invitation_token(
+                generate_invitation_token()
+            ),
+            expires_at=datetime.now() + timedelta(hours=24),
+        )
+
+def test_invitation_rejects_short_token_hash(invitation_users, tenant):
+    with pytest.raises(
+        ValueError,
+        match="Invalid invitation token hash",
+    ):
+        create_invitation(
+            tenant_id=tenant["tenant_id"],
+            email="short-hash@example.com",
+            role="member",
+            invited_by=invitation_users["owner"]["user_id"],
+            token_hash="a" * 32,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        )
+
+def test_invitation_rejects_non_hex_token_hash(invitation_users, tenant):
+    with pytest.raises(
+        ValueError,
+        match="Invalid invitation token hash",
+    ):
+        create_invitation(
+            tenant_id=tenant["tenant_id"],
+            email="non-hex-hash@example.com",
+            role="member",
+            invited_by=invitation_users["owner"]["user_id"],
+            token_hash="g" * 64,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        )
+
+def test_invitation_normalizes_email(invitation_users, tenant):
+    result = create_invitation(
+        tenant_id=tenant["tenant_id"],
+        email="  NEW.USER@EXAMPLE.COM  ",
+        role="member",
+        invited_by=invitation_users["owner"]["user_id"],
+        token_hash=hash_invitation_token(
+            generate_invitation_token()
+        ),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+    )
+
+    assert result["email"] == "new.user@example.com"
+
+def test_invitation_result_does_not_expose_token_hash(
+    invitation_users,
+    tenant,
+):
+    result = create_invitation(
+        tenant_id=tenant["tenant_id"],
+        email="secure-invitation@example.com",
+        role="member",
+        invited_by=invitation_users["owner"]["user_id"],
+        token_hash=hash_invitation_token(
+            generate_invitation_token()
+        ),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+    )
+
+    assert "token_hash" not in result
+    assert "token" not in result
+
+def test_invitation_stores_token_hash(
+    invitation_users,
+    tenant,
+):
+    token = generate_invitation_token()
+    token_hash = hash_invitation_token(token)
+
+    result = create_invitation(
+        tenant_id=tenant["tenant_id"],
+        email="stored-hash@example.com",
+        role="member",
+        invited_by=invitation_users["owner"]["user_id"],
+        token_hash=token_hash,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+    )
+
+    with get_connection() as conn:
+        stored_hash = conn.execute(
+            """
+            SELECT token_hash
+            FROM tenant_invitations
+            WHERE invitation_id = %s;
+            """,
+            (result["invitation_id"],),
+        ).fetchone()
+
+    assert stored_hash[0] == token_hash
+    assert stored_hash[0] != token
+
+def test_new_invitation_starts_pending(
+    invitation_users,
+    tenant,
+):
+    result = create_invitation(
+        tenant_id=tenant["tenant_id"],
+        email="pending-invitation@example.com",
+        role="member",
+        invited_by=invitation_users["owner"]["user_id"],
+        token_hash=hash_invitation_token(
+            generate_invitation_token()
+        ),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+    )
+
+    with get_connection() as conn:
+        invitation = conn.execute(
+            """
+            SELECT accepted_at, revoked_at, expires_at
+            FROM tenant_invitations
+            WHERE invitation_id = %s;
+            """,
+            (result["invitation_id"],),
+        ).fetchone()
+
+    assert invitation[0] is None
+    assert invitation[1] is None
+    assert invitation[2] > datetime.now(timezone.utc)
+
+def test_invitation_records_inviter(
+    invitation_users,
+    tenant,
+):
+    inviter_id = invitation_users["owner"]["user_id"]
+
+    result = create_invitation(
+        tenant_id=tenant["tenant_id"],
+        email="audited-invitation@example.com",
+        role="member",
+        invited_by=inviter_id,
+        token_hash=hash_invitation_token(
+            generate_invitation_token()
+        ),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+    )
+
+    with get_connection() as conn:
+        recorded_inviter = conn.execute(
+            """
+            SELECT invited_by
+            FROM tenant_invitations
+            WHERE invitation_id = %s;
+            """,
+            (result["invitation_id"],),
+        ).fetchone()
+
+    assert recorded_inviter[0] == inviter_id
+
+def test_invitation_records_correct_tenant(
+    invitation_users,
+    tenant,
+):
+    result = create_invitation(
+        tenant_id=tenant["tenant_id"],
+        email="tenant-check@example.com",
+        role="member",
+        invited_by=invitation_users["owner"]["user_id"],
+        token_hash=hash_invitation_token(
+            generate_invitation_token()
+        ),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+    )
+
+    with get_connection() as conn:
+        recorded_tenant = conn.execute(
+            """
+            SELECT tenant_id
+            FROM tenant_invitations
+            WHERE invitation_id = %s;
+            """,
+            (result["invitation_id"],),
+        ).fetchone()
+
+    assert recorded_tenant[0] == tenant["tenant_id"]
+    assert result["tenant_id"] == tenant["tenant_id"]
+
+def test_existing_member_cannot_be_invited_again(
+    invitation_users,
+    tenant,
+):
+    existing_member_email = invitation_users["member"]["email"]
+
+    with pytest.raises(
+        ValueError,
+        match="already an active tenant member",
+    ):
+        create_invitation(
+            tenant_id=tenant["tenant_id"],
+            email=existing_member_email,
+            role="member",
+            invited_by=invitation_users["owner"]["user_id"],
+            token_hash=hash_invitation_token(
+                generate_invitation_token()
+            ),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        )
+
+def test_existing_member_can_be_invited_to_another_tenant(
+    invitation_users,
+    tenant,
+):
+    # Create a second tenant.
+    other_tenant = create_tenant(
+        name="Another Invitation Tenant",
+        slug=f"another-invitation-{uuid.uuid4().hex}",
+    )
+
+    # The inviter must be an active owner of the second tenant.
+    create_membership(
+        other_tenant["tenant_id"],
+        invitation_users["owner"]["user_id"],
+        "owner",
+    )
+
+    try:
+        # Invite a user who already belongs to the original tenant.
+        result = create_invitation(
+            tenant_id=other_tenant["tenant_id"],
+            email=invitation_users["member"]["email"],
+            role="member",
+            invited_by=invitation_users["owner"]["user_id"],
+            token_hash=hash_invitation_token(
+                generate_invitation_token()
+            ),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        )
+
+        # Verify the invitation belongs to the second tenant.
+        assert result["tenant_id"] == other_tenant["tenant_id"]
+        assert result["email"] == invitation_users["member"]["email"]
+
+    finally:
+        # Clean up all records belonging to the second tenant.
+        with get_connection() as conn:
+            conn.execute(
+                """
+                DELETE FROM tenant_invitations
+                WHERE tenant_id = %s;
+                """,
+                (other_tenant["tenant_id"],),
+            )
+
+            conn.execute(
+                """
+                DELETE FROM tenant_memberships
+                WHERE tenant_id = %s;
+                """,
+                (other_tenant["tenant_id"],),
+            )
+
+            conn.execute(
+                """
+                DELETE FROM tenants
+                WHERE tenant_id = %s;
+                """,
+                (other_tenant["tenant_id"],),
+            )
+
+# =========================================================
+# TENANT INVITATION ACCEPTANCE TESTS
+# =========================================================
+
+def test_user_can_accept_valid_invitation(
+    pending_invitation,
+    invited_user,
+    tenant,
+):
+    result = accept_invitation(
+        token_hash=pending_invitation["token_hash"],
+        user_id=invited_user["user_id"],
+    )
+
+    # The invitation should be marked as accepted.
+    assert result["invitation_id"] == (
+        pending_invitation["invitation"]["invitation_id"]
+    )
+    assert result["tenant_id"] == tenant["tenant_id"]
+    assert result["email"] == pending_invitation["email"]
+    assert result["role"] == "member"
+    assert result["accepted_at"] is not None
+
+    # The user should now have an active membership.
+    membership = get_active_membership(
+        tenant["tenant_id"],
+        invited_user["user_id"],
+    )
+
+    assert membership is not None
+    assert membership["is_active"] is True
+    assert membership["role"] == "member"
+
+    # Sensitive token hashes must not be returned.
+    assert "token_hash" not in result
+
+def test_user_cannot_accept_invitation_for_different_email(
+    pending_invitation,
+    tenant,
+):
+    different_user = create_user(
+        f"wrong-user-{uuid.uuid4().hex}@example.com",
+        "test-password-hash",
+    )
+
+    try:
+        with pytest.raises(
+            PermissionError,
+            match="Invitation email does not match user email",
+        ):
+            accept_invitation(
+                token_hash=pending_invitation["token_hash"],
+                user_id=different_user["user_id"],
+            )
+
+        # No membership should have been created.
+        membership = get_active_membership(
+            tenant["tenant_id"],
+            different_user["user_id"],
+        )
+
+        assert membership is None
+
+        # The invitation must remain pending.
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT accepted_at
+                FROM tenant_invitations
+                WHERE invitation_id = %s;
+                """,
+                (pending_invitation["invitation"]["invitation_id"],),
+            ).fetchone()
+
+        assert row[0] is None
+
+    finally:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                DELETE FROM tenant_memberships
+                WHERE user_id = %s;
+                """,
+                (different_user["user_id"],),
+            )
+            conn.execute(
+                """
+                DELETE FROM users
+                WHERE user_id = %s;
+                """,
+                (different_user["user_id"],),
+            )
+
+def test_accept_invitation_rejects_unknown_token(invited_user):
+    unknown_token_hash = hash_invitation_token(
+        generate_invitation_token()
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Invitation not found",
+    ):
+        accept_invitation(
+            token_hash=unknown_token_hash,
+            user_id=invited_user["user_id"],
+        )
+
+def test_accept_invitation_rejects_expired_invitation(
+    pending_invitation,
+    invited_user,
+):
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE tenant_invitations
+            SET expires_at = NOW() - INTERVAL '1 hour'
+            WHERE invitation_id = %s;
+            """,
+            (pending_invitation["invitation"]["invitation_id"],),
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="Invitation has expired",
+    ):
+        accept_invitation(
+            token_hash=pending_invitation["token_hash"],
+            user_id=invited_user["user_id"],
+        )
+
+def test_accept_invitation_rejects_revoked_invitation(
+    pending_invitation,
+    invited_user,
+):
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE tenant_invitations
+            SET revoked_at = NOW()
+            WHERE invitation_id = %s;
+            """,
+            (pending_invitation["invitation"]["invitation_id"],),
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="Invitation has been revoked",
+    ):
+        accept_invitation(
+            token_hash=pending_invitation["token_hash"],
+            user_id=invited_user["user_id"],
+        )
+
+def test_accept_invitation_cannot_be_accepted_twice(
+    pending_invitation,
+    invited_user,
+):
+    # First acceptance should succeed.
+    accept_invitation(
+        token_hash=pending_invitation["token_hash"],
+        user_id=invited_user["user_id"],
+    )
+
+    # Reusing the same invitation must fail.
+    with pytest.raises(
+        ValueError,
+        match="Invitation has already been accepted",
+    ):
+        accept_invitation(
+            token_hash=pending_invitation["token_hash"],
+            user_id=invited_user["user_id"],
+        )
+
+def test_accept_invitation_reactivates_inactive_membership(
+    pending_invitation,
+    invited_user,
+    tenant,
+):
+    # Create an inactive membership for the invited user.
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO tenant_memberships (
+                tenant_id,
+                user_id,
+                role,
+                is_active
+            )
+            VALUES (%s, %s, 'admin', FALSE);
+            """,
+            (tenant["tenant_id"], invited_user["user_id"]),
+        )
+
+    result = accept_invitation(
+        token_hash=pending_invitation["token_hash"],
+        user_id=invited_user["user_id"],
+    )
+
+    membership = get_active_membership(
+        tenant["tenant_id"],
+        invited_user["user_id"],
+    )
+
+    assert membership is not None
+    assert membership["is_active"] is True
+    assert membership["role"] == "member"
+    assert result["role"] == "member"
+    assert result["accepted_at"] is not None
+
+def test_accept_invitation_rejects_existing_active_membership(
+    pending_invitation,
+    invited_user,
+    tenant,
+):
+    # Simulate the user becoming an active member after the invitation
+    # was created.
+    create_membership(
+        tenant["tenant_id"],
+        invited_user["user_id"],
+        role="admin",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="User is already an active member",
+    ):
+        accept_invitation(
+            token_hash=pending_invitation["token_hash"],
+            user_id=invited_user["user_id"],
+        )
+
+    # The existing membership must remain unchanged.
+    membership = get_active_membership(
+        tenant["tenant_id"],
+        invited_user["user_id"],
+    )
+
+    assert membership is not None
+    assert membership["role"] == "admin"
+
+    # The invitation must remain pending.
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT accepted_at
+            FROM tenant_invitations
+            WHERE invitation_id = %s;
+            """,
+            (pending_invitation["invitation"]["invitation_id"],),
+        ).fetchone()
+
+    assert row[0] is None
+
+def test_inactive_user_cannot_accept_invitation(
+    pending_invitation,
+    invited_user,
+    tenant,
+):
+    # Deactivate the invited user's account.
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET is_active = FALSE
+            WHERE user_id = %s;
+            """,
+            (invited_user["user_id"],),
+        )
+
+    with pytest.raises(
+        PermissionError,
+        match="User account is inactive",
+    ):
+        accept_invitation(
+            token_hash=pending_invitation["token_hash"],
+            user_id=invited_user["user_id"],
+        )
+
+    # No membership should have been created.
+    membership = get_active_membership(
+        tenant["tenant_id"],
+        invited_user["user_id"],
+    )
+
+    assert membership is None
+
+    # The invitation must remain pending.
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT accepted_at
+            FROM tenant_invitations
+            WHERE invitation_id = %s;
+            """,
+            (pending_invitation["invitation"]["invitation_id"],),
+        ).fetchone()
+
+    assert row[0] is None
+
+def test_accept_invitation_rejects_nonexistent_user(
+    pending_invitation,
+):
+    nonexistent_user_id = uuid.uuid4()
+
+    with pytest.raises(
+        ValueError,
+        match="User not found",
+    ):
+        accept_invitation(
+            token_hash=pending_invitation["token_hash"],
+            user_id=nonexistent_user_id,
         )

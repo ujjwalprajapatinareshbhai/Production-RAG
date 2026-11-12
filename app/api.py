@@ -3,6 +3,7 @@ from typing import Any
 from uuid import UUID
 
 import jwt
+from contextlib import asynccontextmanager
 from fastapi import (
     Depends,
     FastAPI,
@@ -16,13 +17,20 @@ from fastapi.security import (
 from pydantic import BaseModel, Field
 
 from app.answer import answer_question
-from app.auth import decode_access_token
+from app.auth import (
+    create_access_token,
+    decode_access_token,
+    hash_invitation_token,
+    verify_password,
+)
 from app.config import settings
 from app.db import get_connection
 from app.document_management import delete_document
 from app.registry import (
+    accept_invitation,
     get_active_membership,
     get_document,
+    get_user_by_email,
     get_user_by_id,
     initialize_registry,
     list_documents,
@@ -33,22 +41,39 @@ from app.vector_store import get_vector_client
 
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Manage application startup and shutdown.
+
+    Startup:
+        Initialize the PostgreSQL document registry.
+
+    Shutdown:
+        Release application resources if needed in the future.
+    """
+
+    # Startup logic.
+    initialize_registry()
+    logger.info("Document registry initialized.")
+
+    yield
+
+    # Shutdown logic can be added here when required.
+
+
 app = FastAPI(
     title="Production RAG API",
     description="Search ingested PDF documents using hybrid retrieval and reranking.",
     version="1.0.0",
+    lifespan=lifespan,
 )
+
 
 # HTTP Bearer authentication.
 # auto_error=False allows us to return our own consistent 401 response.
 bearer_scheme = HTTPBearer(auto_error=False)
-
-
-@app.on_event("startup")
-def startup_event() -> None:
-    """Initialize required database tables when the API starts."""
-    initialize_registry()
-    logger.info("Document registry initialized.")
 
 
 # ---------------------------------------------------------
@@ -125,6 +150,32 @@ def get_current_user(
 # Request and response models
 # ---------------------------------------------------------
 
+class LoginRequest(BaseModel):
+    """Credentials and tenant selection for user login."""
+
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=12, max_length=128)
+    tenant_id: UUID
+
+
+class AcceptInvitationRequest(BaseModel):
+    """Credentials and invitation token used to join a tenant."""
+
+    token: str = Field(min_length=1, max_length=512)
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=12, max_length=128)
+
+
+class LoginResponse(BaseModel):
+    """JWT access token returned after successful login."""
+
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    tenant_id: UUID
+    role: str
+
+
 class SearchRequest(BaseModel):
     """Input provided by a client searching the document collection."""
 
@@ -184,6 +235,149 @@ class DocumentListResponse(BaseModel):
 
     count: int
     documents: list[DocumentResponse]
+
+
+# ---------------------------------------------------------
+# Document endpoints
+# ---------------------------------------------------------
+
+# ---------------------------------------------------------
+# Authentication endpoints
+# ---------------------------------------------------------
+
+@app.post(
+    "/auth/login",
+    response_model=LoginResponse,
+)
+def login(request: LoginRequest) -> LoginResponse:
+    """Authenticate a user and issue a tenant-scoped JWT."""
+
+    # 1. Find the user by email.
+    user = get_user_by_email(request.email.strip().lower())
+
+    # 2. Verify credentials without revealing which one failed.
+    if user is None or not verify_password(
+        request.password,
+        user["password_hash"],
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 3. Check whether the account is active.
+    if user.get("is_active") is not True:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 4. Verify active membership in the selected tenant.
+    membership = get_active_membership(
+        tenant_id=request.tenant_id,
+        user_id=user["user_id"],
+    )
+
+    if membership is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No active membership in the selected tenant.",
+        )
+
+    # 5. Read the trusted role from PostgreSQL.
+    role = membership["role"]
+
+    # 6. Generate a tenant-scoped JWT.
+    access_token = create_access_token(
+        user_id=str(user["user_id"]),
+        tenant_id=str(request.tenant_id),
+        role=role,
+    )
+
+    # 7. Return the token and its metadata.
+    return LoginResponse(
+        access_token=access_token,
+        token_type="bearer",
+        expires_in=settings.access_token_expire_minutes * 60,
+        tenant_id=request.tenant_id,
+        role=role,
+    )
+
+
+@app.post(
+    "/auth/accept-invitation",
+    response_model=LoginResponse,
+)
+def accept_invitation_endpoint(
+    request: AcceptInvitationRequest,
+) -> LoginResponse:
+    """Authenticate an invited user and activate tenant membership."""
+
+    # 1. Find the user by email.
+    user = get_user_by_email(request.email.strip().lower())
+
+    # 2. Authenticate the user.
+    if user is None or not verify_password(
+        request.password,
+        user["password_hash"],
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 3. Ensure the account is active.
+    if user.get("is_active") is not True:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 4. Hash the raw invitation token.
+    token_hash = hash_invitation_token(request.token)
+
+    # 5. Accept the invitation in PostgreSQL.
+    try:
+        invitation = accept_invitation(
+            token_hash=token_hash,
+            user_id=user["user_id"],
+        )
+
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    # 6. Get trusted tenant and role from the accepted invitation.
+    tenant_id = invitation["tenant_id"]
+    role = invitation["role"]
+
+    # 7. Generate a JWT for the newly joined tenant.
+    access_token = create_access_token(
+        user_id=str(user["user_id"]),
+        tenant_id=str(tenant_id),
+        role=role,
+    )
+
+    # 8. Return the token and tenant metadata.
+    return LoginResponse(
+        access_token=access_token,
+        token_type="bearer",
+        expires_in=settings.access_token_expire_minutes * 60,
+        tenant_id=tenant_id,
+        role=role,
+    )
 
 
 # ---------------------------------------------------------

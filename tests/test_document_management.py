@@ -64,3 +64,51 @@ def test_registry_delete_failure_leaves_document_marked_failed(
     )
 
     mock_refresh.assert_not_called()
+
+
+@patch("app.document_management.refresh_bm25_index")
+@patch("app.document_management.delete_document_record")
+@patch("app.document_management.delete_document_chunks")
+@patch(
+    "app.document_management.update_document_status",
+    return_value=None,
+)
+@patch(
+    "app.document_management.get_document",
+    return_value={
+        "tenant_id": TEST_TENANT_ID,
+        "document_id": DOCUMENT_ID,
+        "filename": "sample.pdf",
+    },
+)
+def test_status_update_failure_stops_document_deletion(
+    mock_get_document,
+    mock_update_status,
+    mock_delete_chunks,
+    mock_delete_record,
+    mock_refresh,
+):
+    with pytest.raises(
+        ValueError,
+        match="Document not found.",
+    ):
+        delete_document(
+            TEST_TENANT_ID,
+            DOCUMENT_ID,
+        )
+
+    mock_get_document.assert_called_once_with(
+        TEST_TENANT_ID,
+        DOCUMENT_ID,
+    )
+
+    mock_update_status.assert_called_once_with(
+        TEST_TENANT_ID,
+        DOCUMENT_ID,
+        status="failed",
+        error_message="Document deletion in progress.",
+    )
+
+    mock_delete_chunks.assert_not_called()
+    mock_delete_record.assert_not_called()
+    mock_refresh.assert_not_called()

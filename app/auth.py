@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any
-
+import hashlib
+import secrets
 import jwt
 from pwdlib import PasswordHash
 
@@ -21,6 +22,29 @@ def hash_password(password: str) -> str:
         raise ValueError("Password cannot be empty.")
 
     return password_hasher.hash(password)
+
+def generate_invitation_token() -> str:
+    """
+    Generate a cryptographically secure invitation token.
+
+    The original token is returned only once so it can
+    be delivered to the invited user.
+    """
+    return secrets.token_urlsafe(32)
+
+
+def hash_invitation_token(token: str) -> str:
+    """
+    Generate a SHA-256 hash of an invitation token.
+
+    Only this hash should be stored in PostgreSQL.
+    """
+    if not token:
+        raise ValueError("Invitation token cannot be empty.")
+
+    return hashlib.sha256(
+        token.encode("utf-8")
+    ).hexdigest()
 
 
 def verify_password(

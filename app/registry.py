@@ -1,5 +1,5 @@
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
-
 from psycopg.rows import dict_row
 
 from app.db import get_connection
@@ -14,6 +14,11 @@ VALID_STATUSES = {
 
 VALID_ROLES = {
     "owner",
+    "admin",
+    "member",
+}
+
+INVITATION_ROLES = {
     "admin",
     "member",
 }
@@ -424,6 +429,100 @@ def create_membership(
             )
             return cursor.fetchone()
 
+def bootstrap_first_owner(
+    tenant_slug: str,
+    email: str,
+    password_hash: str,
+) -> dict:
+    """
+    Create the first owner of a tenant.
+
+    User creation and owner membership happen in one
+    PostgreSQL transaction.
+    """
+
+    if not tenant_slug or not tenant_slug.strip():
+        raise ValueError("Tenant slug cannot be empty.")
+
+    if not email or not email.strip():
+        raise ValueError("Email cannot be empty.")
+
+    if not password_hash:
+        raise ValueError("Password hash cannot be empty.")
+
+    normalized_email = email.strip().lower()
+
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+
+            # 1. Lock the tenant row to prevent concurrent bootstrap.
+            cursor.execute(
+                """
+                SELECT tenant_id, name, slug
+                FROM tenants
+                WHERE slug = %s
+                FOR UPDATE;
+                """,
+                (tenant_slug.strip(),),
+            )
+
+            tenant = cursor.fetchone()
+
+            if tenant is None:
+                raise ValueError("Tenant does not exist.")
+
+            # 2. Refuse bootstrap if an owner already exists.
+            cursor.execute(
+                """
+                SELECT user_id
+                FROM tenant_memberships
+                WHERE tenant_id = %s
+                  AND role = 'owner'
+                LIMIT 1;
+                """,
+                (tenant["tenant_id"],),
+            )
+
+            if cursor.fetchone() is not None:
+                raise ValueError(
+                    "This tenant already has an owner. "
+                    "Bootstrap is not allowed."
+                )
+
+            # 3. Create the user.
+            cursor.execute(
+                """
+                INSERT INTO users (email, password_hash)
+                VALUES (%s, %s)
+                RETURNING user_id, email, is_active, created_at;
+                """,
+                (normalized_email, password_hash),
+            )
+
+            user = cursor.fetchone()
+
+            # 4. Create the owner's tenant membership.
+            cursor.execute(
+                """
+                INSERT INTO tenant_memberships (
+                    tenant_id,
+                    user_id,
+                    role
+                )
+                VALUES (%s, %s, 'owner')
+                RETURNING tenant_id, user_id, role, is_active;
+                """,
+                (tenant["tenant_id"], user["user_id"]),
+            )
+
+            membership = cursor.fetchone()
+
+            return {
+                "tenant": tenant,
+                "user": user,
+                "membership": membership,
+            }
+
 
 def get_active_membership(
     tenant_id: UUID,
@@ -448,7 +547,323 @@ def get_active_membership(
             cursor.execute(sql, (tenant_id, user_id))
             return cursor.fetchone()
 
+def create_invitation(
+    tenant_id: UUID,
+    email: str,
+    role: str,
+    invited_by: UUID,
+    token_hash: str,
+    expires_at: datetime,
+) -> dict:
+    """
+    Create a tenant invitation.
 
+    Owners can invite admins and members.
+    Admins can invite members only.
+
+    Only the SHA-256 token hash is stored.
+    """
+
+    # 1. Validate email.
+    if not email or not email.strip():
+        raise ValueError("Email cannot be empty.")
+
+    normalized_email = email.strip().lower()
+
+    # 2. Validate invitation role.
+    if role not in INVITATION_ROLES:
+        raise ValueError(f"Invalid invitation role: {role}.")
+
+    # 3. Validate token hash.
+    if (
+        not token_hash
+        or len(token_hash) != 64
+        or not all(c in "0123456789abcdef" for c in token_hash.lower())
+    ):
+        raise ValueError("Invalid invitation token hash.")
+
+    # 4. Validate expiry timestamp.
+    if (
+        expires_at.tzinfo is None
+        or expires_at.utcoffset() is None
+    ):
+        raise ValueError("Invitation expiry must be timezone-aware.")
+
+    if expires_at <= datetime.now(timezone.utc):
+        raise ValueError("Invitation expiry must be in the future.")
+
+    # 5. Start database transaction.
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+
+            # 6. Lock and verify inviter membership.
+            cursor.execute(
+                """
+                SELECT role
+                FROM tenant_memberships
+                WHERE tenant_id = %s
+                  AND user_id = %s
+                  AND is_active = TRUE
+                FOR UPDATE;
+                """,
+                (tenant_id, invited_by),
+            )
+
+            inviter = cursor.fetchone()
+
+            if inviter is None:
+                raise PermissionError(
+                    "Active tenant membership required."
+                )
+
+            inviter_role = inviter["role"]
+
+            # 7. Enforce invitation permissions.
+            if inviter_role not in {"owner", "admin"}:
+                raise PermissionError(
+                    "Only owners and admins can invite users."
+                )
+
+            if role == "admin" and inviter_role != "owner":
+                raise PermissionError(
+                    "Only owners can invite administrators."
+                )
+
+            # 8. Revoke expired outstanding invitations.
+            # This prevents the unique pending-email index
+            # from blocking a new invitation.
+            cursor.execute(
+                """
+                UPDATE tenant_invitations
+                SET revoked_at = NOW()
+                WHERE tenant_id = %s
+                  AND lower(email) = %s
+                  AND accepted_at IS NULL
+                  AND revoked_at IS NULL
+                  AND expires_at <= NOW();
+                """,
+                (tenant_id, normalized_email),
+            )
+
+            # 9. Prevent invitations to existing active members.
+            cursor.execute(
+                """
+                SELECT 1
+                FROM users AS u
+                JOIN tenant_memberships AS tm
+                  ON tm.user_id = u.user_id
+                WHERE tm.tenant_id = %s
+                  AND lower(u.email) = %s
+                  AND tm.is_active = TRUE
+                LIMIT 1;
+                """,
+                (tenant_id, normalized_email),
+            )
+
+            if cursor.fetchone() is not None:
+                raise ValueError(
+                    "This user is already an active tenant member."
+                )
+
+            # 10. Insert the invitation.
+            cursor.execute(
+                """
+                INSERT INTO tenant_invitations (
+                    tenant_id,
+                    email,
+                    role,
+                    token_hash,
+                    invited_by,
+                    expires_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING
+                    invitation_id,
+                    tenant_id,
+                    email,
+                    role,
+                    invited_by,
+                    expires_at,
+                    created_at;
+                """,
+                (
+                    tenant_id,
+                    normalized_email,
+                    role,
+                    token_hash,
+                    invited_by,
+                    expires_at,
+                ),
+            )
+
+            return cursor.fetchone()
+
+def accept_invitation(
+    token_hash: str,
+    user_id: UUID,
+) -> dict:
+    """
+    Accept a tenant invitation.
+
+    Validates the invitation and authenticated user's email,
+    creates or reactivates membership, and marks the invitation
+    accepted in one database transaction.
+    """
+
+    if not token_hash:
+        raise ValueError("Invitation token hash cannot be empty.")
+
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+
+            # 1. Find and lock the invitation.
+            cursor.execute(
+                """
+                SELECT
+                    invitation_id,
+                    tenant_id,
+                    email,
+                    role,
+                    expires_at,
+                    accepted_at,
+                    revoked_at
+                FROM tenant_invitations
+                WHERE token_hash = %s
+                FOR UPDATE;
+                """,
+                (token_hash,),
+            )
+
+            invitation = cursor.fetchone()
+
+            if invitation is None:
+                raise ValueError("Invitation not found.")
+
+            # 2. Check invitation state.
+            if invitation["accepted_at"] is not None:
+                raise ValueError(
+                    "Invitation has already been accepted."
+                )
+
+            if invitation["revoked_at"] is not None:
+                raise ValueError(
+                    "Invitation has been revoked."
+                )
+
+            if invitation["expires_at"] <= datetime.now(timezone.utc):
+                raise ValueError(
+                    "Invitation has expired."
+                )
+
+            # 3. Find and lock the authenticated user.
+            cursor.execute(
+                """
+                SELECT email, is_active
+                FROM users
+                WHERE user_id = %s
+                FOR UPDATE;
+                """,
+                (user_id,),
+            )
+
+            user = cursor.fetchone()
+
+            if user is None:
+                raise ValueError("User not found.")
+
+            if not user["is_active"]:
+                raise PermissionError(
+                    "User account is inactive."
+                )
+
+            # 4. Verify the actual database email.
+            if (
+                user["email"].strip().lower()
+                != invitation["email"].strip().lower()
+            ):
+                raise PermissionError(
+                    "Invitation email does not match user email."
+                )
+
+            # 5. Check for an existing membership.
+            cursor.execute(
+                """
+                SELECT role, is_active
+                FROM tenant_memberships
+                WHERE tenant_id = %s
+                  AND user_id = %s
+                FOR UPDATE;
+                """,
+                (
+                    invitation["tenant_id"],
+                    user_id,
+                ),
+            )
+
+            membership = cursor.fetchone()
+
+            if membership is not None and membership["is_active"]:
+                raise ValueError(
+                    "User is already an active member."
+                )
+
+            # 6. Create or reactivate the membership.
+            if membership is not None:
+                cursor.execute(
+                    """
+                    UPDATE tenant_memberships
+                    SET
+                        role = %s,
+                        is_active = TRUE
+                    WHERE tenant_id = %s
+                      AND user_id = %s;
+                    """,
+                    (
+                        invitation["role"],
+                        invitation["tenant_id"],
+                        user_id,
+                    ),
+                )
+
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO tenant_memberships (
+                        tenant_id,
+                        user_id,
+                        role,
+                        is_active
+                    )
+                    VALUES (%s, %s, %s, TRUE);
+                    """,
+                    (
+                        invitation["tenant_id"],
+                        user_id,
+                        invitation["role"],
+                    ),
+                )
+
+            # 7. Mark the invitation as accepted.
+            cursor.execute(
+                """
+                UPDATE tenant_invitations
+                SET accepted_at = NOW()
+                WHERE invitation_id = %s
+                RETURNING accepted_at;
+                """,
+                (invitation["invitation_id"],),
+            )
+
+            accepted = cursor.fetchone()
+
+            # 8. Return safe invitation metadata.
+            return {
+                "invitation_id": invitation["invitation_id"],
+                "tenant_id": invitation["tenant_id"],
+                "email": invitation["email"],
+                "role": invitation["role"],
+                "accepted_at": accepted["accepted_at"],
+            }
 # =========================================================
 # DOCUMENT REGISTRY
 # =========================================================

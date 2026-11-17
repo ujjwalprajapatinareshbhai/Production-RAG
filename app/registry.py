@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+﻿from datetime import datetime, timezone
 from uuid import UUID, uuid4
 from psycopg.rows import dict_row
 
@@ -864,6 +864,138 @@ def accept_invitation(
                 "role": invitation["role"],
                 "accepted_at": accepted["accepted_at"],
             }
+
+
+def register_and_accept_invitation(
+    token_hash: str,
+    email: str,
+    password_hash: str,
+) -> dict:
+    """
+    Register a new user and accept their tenant invitation
+    in one database transaction.
+    """
+
+    if not token_hash:
+        raise ValueError("Invitation token hash cannot be empty.")
+
+    if not email or not email.strip():
+        raise ValueError("Email cannot be empty.")
+
+    if not password_hash:
+        raise ValueError("Password hash cannot be empty.")
+
+    normalized_email = email.strip().lower()
+
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+
+            # 1. Find and lock the invitation.
+            cursor.execute(
+                """
+                SELECT
+                    invitation_id,
+                    tenant_id,
+                    email,
+                    role,
+                    expires_at,
+                    accepted_at,
+                    revoked_at
+                FROM tenant_invitations
+                WHERE token_hash = %s
+                FOR UPDATE;
+                """,
+                (token_hash,),
+            )
+
+            invitation = cursor.fetchone()
+
+            if invitation is None:
+                raise ValueError("Invitation not found.")
+
+            # 2. Validate invitation state.
+            if invitation["accepted_at"] is not None:
+                raise ValueError(
+                    "Invitation has already been accepted."
+                )
+
+            if invitation["revoked_at"] is not None:
+                raise ValueError(
+                    "Invitation has been revoked."
+                )
+
+            if invitation["expires_at"] <= datetime.now(timezone.utc):
+                raise ValueError(
+                    "Invitation has expired."
+                )
+
+            # 3. Verify the submitted email.
+            if normalized_email != invitation["email"].strip().lower():
+                raise PermissionError(
+                    "Invitation email does not match submitted email."
+                )
+
+            # 4. Create the new user.
+            cursor.execute(
+                """
+                INSERT INTO users (email, password_hash)
+                VALUES (%s, %s)
+                ON CONFLICT (LOWER(email)) DO NOTHING
+                RETURNING user_id, email, is_active;
+                """,
+                (normalized_email, password_hash),
+            )
+
+            user = cursor.fetchone()
+
+            if user is None:
+                raise ValueError(
+                    "An account with this email already exists. "
+                    "Sign in and accept the invitation instead."
+                )
+
+            # 5. Create tenant membership.
+            cursor.execute(
+                """
+                INSERT INTO tenant_memberships (
+                    tenant_id,
+                    user_id,
+                    role,
+                    is_active
+                )
+                VALUES (%s, %s, %s, TRUE);
+                """,
+                (
+                    invitation["tenant_id"],
+                    user["user_id"],
+                    invitation["role"],
+                ),
+            )
+
+            # 6. Mark invitation as accepted.
+            cursor.execute(
+                """
+                UPDATE tenant_invitations
+                SET accepted_at = NOW()
+                WHERE invitation_id = %s
+                RETURNING accepted_at;
+                """,
+                (invitation["invitation_id"],),
+            )
+
+            accepted = cursor.fetchone()
+
+            # 7. Return safe registration metadata.
+            return {
+                "user_id": user["user_id"],
+                "email": user["email"],
+                "tenant_id": invitation["tenant_id"],
+                "role": invitation["role"],
+                "invitation_id": invitation["invitation_id"],
+                "accepted_at": accepted["accepted_at"],
+            }
+
+
 # =========================================================
 # DOCUMENT REGISTRY
 # =========================================================

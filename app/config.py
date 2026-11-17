@@ -32,8 +32,8 @@ class Settings(BaseSettings):
     ollama_model: str = "gemma4:cloud"
 
     # PostgreSQL
-    postgres_host: str = "localhost"
-    postgres_port: int = 5433
+    postgres_host: str = "127.0.0.1"
+    postgres_port: int = 5434
     postgres_db: str
     postgres_user: str
     postgres_password: str

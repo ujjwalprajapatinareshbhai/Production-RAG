@@ -1,7 +1,8 @@
+
 import logging
 from typing import Any
 from uuid import UUID
-
+from datetime import datetime, timedelta, timezone
 import jwt
 from contextlib import asynccontextmanager
 from fastapi import (
@@ -20,7 +21,9 @@ from app.answer import answer_question
 from app.auth import (
     create_access_token,
     decode_access_token,
+    generate_invitation_token,
     hash_invitation_token,
+    hash_password,
     verify_password,
 )
 from app.config import settings
@@ -28,12 +31,14 @@ from app.db import get_connection
 from app.document_management import delete_document
 from app.registry import (
     accept_invitation,
+    create_invitation,
     get_active_membership,
     get_document,
     get_user_by_email,
     get_user_by_id,
     initialize_registry,
     list_documents,
+    register_and_accept_invitation as register_user_and_accept_invitation,
 )
 from app.search import search_documents
 from app.vector_store import get_vector_client
@@ -156,6 +161,25 @@ class LoginRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=12, max_length=128)
     tenant_id: UUID
+
+
+class CreateInvitationRequest(BaseModel):
+    """Details required to invite a user to the current tenant."""
+
+    email: str = Field(min_length=3, max_length=320)
+    role: str = Field(pattern="^(admin|member)$")
+
+
+class CreateInvitationResponse(BaseModel):
+    """Invitation details returned to the authorized inviter."""
+
+    invitation_id: UUID
+    tenant_id: UUID
+    email: str
+    role: str
+    token: str
+    expires_at: datetime
+    created_at: datetime
 
 
 class AcceptInvitationRequest(BaseModel):
@@ -307,6 +331,61 @@ def login(request: LoginRequest) -> LoginResponse:
 
 
 @app.post(
+    "/auth/invitations",
+    response_model=CreateInvitationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_invitation_endpoint(
+    request: CreateInvitationRequest,
+    current_user: dict = Depends(get_current_user),
+) -> CreateInvitationResponse:
+    """Create an invitation for the authenticated user's tenant."""
+
+    # 1. Generate a secure raw invitation token.
+    token = generate_invitation_token()
+
+    # 2. Hash the token before storing it.
+    token_hash = hash_invitation_token(token)
+
+    # 3. Set invitation expiry to 7 days.
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+
+    # 4. Create the invitation in PostgreSQL.
+    try:
+        invitation = create_invitation(
+            tenant_id=current_user["tenant_id"],
+            email=request.email.strip().lower(),
+            role=request.role,
+            invited_by=current_user["user_id"],
+            token_hash=token_hash,
+            expires_at=expires_at,
+        )
+
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    # 5. Return the raw token only to the authorized inviter.
+    return CreateInvitationResponse(
+        invitation_id=invitation["invitation_id"],
+        tenant_id=invitation["tenant_id"],
+        email=invitation["email"],
+        role=invitation["role"],
+        token=token,
+        expires_at=invitation["expires_at"],
+        created_at=invitation["created_at"],
+    )
+
+
+@app.post(
     "/auth/accept-invitation",
     response_model=LoginResponse,
 )
@@ -371,6 +450,63 @@ def accept_invitation_endpoint(
     )
 
     # 8. Return the token and tenant metadata.
+    return LoginResponse(
+        access_token=access_token,
+        token_type="bearer",
+        expires_in=settings.access_token_expire_minutes * 60,
+        tenant_id=tenant_id,
+        role=role,
+    )
+
+
+@app.post(
+    "/auth/register-and-accept-invitation",
+    response_model=LoginResponse,
+)
+def register_and_accept_invitation_endpoint(
+    request: AcceptInvitationRequest,
+) -> LoginResponse:
+    """Register a new user and accept their tenant invitation."""
+
+    # 1. Normalize the email and hash the invitation token/password.
+    normalized_email = request.email.strip().lower()
+
+    try:
+        token_hash = hash_invitation_token(request.token)
+        password_hash = hash_password(request.password)
+
+        # 2. Register the new user and accept the invitation.
+        registration = register_user_and_accept_invitation(
+            token_hash=token_hash,
+            email=normalized_email,
+            password_hash=password_hash,
+        )
+
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    # 3. Get trusted tenant and role from the database result.
+    user_id = registration["user_id"]
+    tenant_id = registration["tenant_id"]
+    role = registration["role"]
+
+    # 4. Generate a JWT for the newly registered user.
+    access_token = create_access_token(
+        user_id=str(user_id),
+        tenant_id=str(tenant_id),
+        role=role,
+    )
+
+    # 5. Return the login response.
     return LoginResponse(
         access_token=access_token,
         token_type="bearer",

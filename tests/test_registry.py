@@ -25,6 +25,7 @@ from app.registry import (
     get_active_membership,
     get_user_by_id,
     accept_invitation,
+    register_and_accept_invitation,
 )
 
 
@@ -1282,6 +1283,7 @@ def test_claim_pending_cleanup_documents_rejects_invalid_lease(
             lease_minutes=lease_minutes,
         )
 
+
 @pytest.fixture
 def invitation_users(tenant):
     """Create and clean up users for invitation tests."""
@@ -1344,6 +1346,7 @@ def invitation_users(tenant):
                 (user["user_id"],),
             )
 
+
 @pytest.fixture
 def pending_invitation(invitation_users, tenant):
     """Create a pending invitation for a new member."""
@@ -1395,6 +1398,7 @@ def invited_user(pending_invitation):
             """,
             (user["user_id"],),
         )
+
 
 # =========================================================
 # TENANT INVITATION PERMISSION TESTS
@@ -1467,6 +1471,7 @@ def test_member_cannot_invite_users(invitation_users, tenant):
             expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
         )
 
+
 def test_duplicate_active_invitation_is_rejected(
     invitation_users,
     tenant,
@@ -1495,6 +1500,7 @@ def test_duplicate_active_invitation_is_rejected(
             ),
             expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
         )
+
 
 def test_expired_invitation_can_be_replaced(
     invitation_users,
@@ -1550,6 +1556,7 @@ def test_expired_invitation_can_be_replaced(
 
     assert old_invitation[0] is not None
 
+
 def test_invitation_rejects_invalid_role(invitation_users, tenant):
     with pytest.raises(
         ValueError,
@@ -1564,8 +1571,9 @@ def test_invitation_rejects_invalid_role(invitation_users, tenant):
                 generate_invitation_token()
             ),
             expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
-     )
-          
+        )
+
+
 def test_invitation_rejects_invalid_token_hash(invitation_users, tenant):
     with pytest.raises(
         ValueError,
@@ -1579,6 +1587,7 @@ def test_invitation_rejects_invalid_token_hash(invitation_users, tenant):
             token_hash="not-a-valid-hash",
             expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
         )
+
 
 def test_invitation_rejects_empty_email(invitation_users, tenant):
     with pytest.raises(
@@ -1596,6 +1605,7 @@ def test_invitation_rejects_empty_email(invitation_users, tenant):
             expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
         )
 
+
 def test_invitation_rejects_past_expiry(invitation_users, tenant):
     with pytest.raises(
         ValueError,
@@ -1611,6 +1621,7 @@ def test_invitation_rejects_past_expiry(invitation_users, tenant):
             ),
             expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
         )
+
 
 def test_invitation_rejects_naive_expiry(invitation_users, tenant):
     with pytest.raises(
@@ -1628,6 +1639,7 @@ def test_invitation_rejects_naive_expiry(invitation_users, tenant):
             expires_at=datetime.now() + timedelta(hours=24),
         )
 
+
 def test_invitation_rejects_short_token_hash(invitation_users, tenant):
     with pytest.raises(
         ValueError,
@@ -1641,6 +1653,7 @@ def test_invitation_rejects_short_token_hash(invitation_users, tenant):
             token_hash="a" * 32,
             expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
         )
+
 
 def test_invitation_rejects_non_hex_token_hash(invitation_users, tenant):
     with pytest.raises(
@@ -1656,6 +1669,7 @@ def test_invitation_rejects_non_hex_token_hash(invitation_users, tenant):
             expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
         )
 
+
 def test_invitation_normalizes_email(invitation_users, tenant):
     result = create_invitation(
         tenant_id=tenant["tenant_id"],
@@ -1669,6 +1683,7 @@ def test_invitation_normalizes_email(invitation_users, tenant):
     )
 
     assert result["email"] == "new.user@example.com"
+
 
 def test_invitation_result_does_not_expose_token_hash(
     invitation_users,
@@ -1687,6 +1702,7 @@ def test_invitation_result_does_not_expose_token_hash(
 
     assert "token_hash" not in result
     assert "token" not in result
+
 
 def test_invitation_stores_token_hash(
     invitation_users,
@@ -1717,6 +1733,7 @@ def test_invitation_stores_token_hash(
     assert stored_hash[0] == token_hash
     assert stored_hash[0] != token
 
+
 def test_new_invitation_starts_pending(
     invitation_users,
     tenant,
@@ -1745,6 +1762,7 @@ def test_new_invitation_starts_pending(
     assert invitation[0] is None
     assert invitation[1] is None
     assert invitation[2] > datetime.now(timezone.utc)
+
 
 def test_invitation_records_inviter(
     invitation_users,
@@ -1775,6 +1793,7 @@ def test_invitation_records_inviter(
 
     assert recorded_inviter[0] == inviter_id
 
+
 def test_invitation_records_correct_tenant(
     invitation_users,
     tenant,
@@ -1803,6 +1822,7 @@ def test_invitation_records_correct_tenant(
     assert recorded_tenant[0] == tenant["tenant_id"]
     assert result["tenant_id"] == tenant["tenant_id"]
 
+
 def test_existing_member_cannot_be_invited_again(
     invitation_users,
     tenant,
@@ -1823,6 +1843,7 @@ def test_existing_member_cannot_be_invited_again(
             ),
             expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
         )
+
 
 def test_existing_member_can_be_invited_to_another_tenant(
     invitation_users,
@@ -1885,6 +1906,103 @@ def test_existing_member_can_be_invited_to_another_tenant(
                 (other_tenant["tenant_id"],),
             )
 
+
+def test_new_user_can_register_and_accept_invitation(
+    pending_invitation,
+    tenant,
+):
+    from app.auth import hash_password
+
+    password_hash = hash_password("SecureTestPassword123!")
+
+    result = register_and_accept_invitation(
+        token_hash=pending_invitation["token_hash"],
+        email=pending_invitation["email"],
+        password_hash=password_hash,
+    )
+
+    # Verify the new user was created.
+    user = get_user_by_id(result["user_id"])
+
+    assert user is not None
+    assert user["email"] == pending_invitation["email"]
+    assert user["is_active"] is True
+
+    # Verify the membership was created.
+    membership = get_active_membership(
+        tenant["tenant_id"],
+        result["user_id"],
+    )
+
+    assert membership is not None
+    assert membership["role"] == "member"
+
+    # Verify the invitation was accepted.
+    assert result["invitation_id"] == (
+        pending_invitation["invitation"]["invitation_id"]
+    )
+    assert result["tenant_id"] == tenant["tenant_id"]
+    assert result["accepted_at"] is not None
+
+    # Verify the stored password is a hash, not plaintext.
+    assert user["password_hash"] != "SecureTestPassword123!"
+
+
+def test_registration_rejects_existing_email_without_consuming_invitation(
+    pending_invitation,
+    invited_user,
+):
+    # Read the original password hash directly from PostgreSQL.
+    with get_connection() as conn:
+        original_password = conn.execute(
+            """
+            SELECT password_hash
+            FROM users
+            WHERE user_id = %s;
+            """,
+            (invited_user["user_id"],),
+        ).fetchone()
+
+    assert original_password is not None
+
+    with pytest.raises(
+        ValueError,
+        match="An account with this email already exists",
+    ):
+        register_and_accept_invitation(
+            token_hash=pending_invitation["token_hash"],
+            email=pending_invitation["email"].upper(),
+            password_hash="new-password-hash",
+        )
+
+    # Verify the existing password hash was not changed.
+    with get_connection() as conn:
+        updated_password = conn.execute(
+            """
+            SELECT password_hash
+            FROM users
+            WHERE user_id = %s;
+            """,
+            (invited_user["user_id"],),
+        ).fetchone()
+
+        invitation = conn.execute(
+            """
+            SELECT accepted_at, revoked_at
+            FROM tenant_invitations
+            WHERE invitation_id = %s;
+            """,
+            (pending_invitation["invitation"]["invitation_id"],),
+        ).fetchone()
+
+    assert updated_password is not None
+    assert updated_password[0] == original_password[0]
+
+    # Verify the invitation remains pending.
+    assert invitation is not None
+    assert invitation[0] is None
+    assert invitation[1] is None
+
 # =========================================================
 # TENANT INVITATION ACCEPTANCE TESTS
 # =========================================================
@@ -1920,6 +2038,7 @@ def test_user_can_accept_valid_invitation(
 
     # Sensitive token hashes must not be returned.
     assert "token_hash" not in result
+
 
 def test_user_cannot_accept_invitation_for_different_email(
     pending_invitation,
@@ -1978,6 +2097,7 @@ def test_user_cannot_accept_invitation_for_different_email(
                 (different_user["user_id"],),
             )
 
+
 def test_accept_invitation_rejects_unknown_token(invited_user):
     unknown_token_hash = hash_invitation_token(
         generate_invitation_token()
@@ -1991,6 +2111,7 @@ def test_accept_invitation_rejects_unknown_token(invited_user):
             token_hash=unknown_token_hash,
             user_id=invited_user["user_id"],
         )
+
 
 def test_accept_invitation_rejects_expired_invitation(
     pending_invitation,
@@ -2015,6 +2136,7 @@ def test_accept_invitation_rejects_expired_invitation(
             user_id=invited_user["user_id"],
         )
 
+
 def test_accept_invitation_rejects_revoked_invitation(
     pending_invitation,
     invited_user,
@@ -2038,6 +2160,7 @@ def test_accept_invitation_rejects_revoked_invitation(
             user_id=invited_user["user_id"],
         )
 
+
 def test_accept_invitation_cannot_be_accepted_twice(
     pending_invitation,
     invited_user,
@@ -2057,6 +2180,7 @@ def test_accept_invitation_cannot_be_accepted_twice(
             token_hash=pending_invitation["token_hash"],
             user_id=invited_user["user_id"],
         )
+
 
 def test_accept_invitation_reactivates_inactive_membership(
     pending_invitation,
@@ -2093,6 +2217,7 @@ def test_accept_invitation_reactivates_inactive_membership(
     assert membership["role"] == "member"
     assert result["role"] == "member"
     assert result["accepted_at"] is not None
+
 
 def test_accept_invitation_rejects_existing_active_membership(
     pending_invitation,
@@ -2137,6 +2262,7 @@ def test_accept_invitation_rejects_existing_active_membership(
         ).fetchone()
 
     assert row[0] is None
+
 
 def test_inactive_user_cannot_accept_invitation(
     pending_invitation,
@@ -2183,6 +2309,7 @@ def test_inactive_user_cannot_accept_invitation(
         ).fetchone()
 
     assert row[0] is None
+
 
 def test_accept_invitation_rejects_nonexistent_user(
     pending_invitation,

@@ -1,4 +1,4 @@
-from contextlib import nullcontext
+﻿from contextlib import nullcontext
 from uuid import UUID
 from datetime import datetime, timezone
 
@@ -765,6 +765,180 @@ def test_accept_invitation_rejects_expired_or_revoked(
 
     assert response.status_code == 400
     assert response.json()["detail"] == error_message
+
+
+# ---------------------------------------------------------
+# New user registration and invitation acceptance
+# ---------------------------------------------------------
+
+def test_register_and_accept_invitation_successfully(monkeypatch):
+    expected_registration = {
+        "user_id": TEST_USER_ID,
+        "tenant_id": TEST_TENANT_ID,
+        "email": "invited@example.com",
+        "role": "member",
+    }
+
+    # Mock invitation token hashing.
+    def fake_hash_invitation_token(token):
+        assert token == "raw-invitation-token"
+        return "a" * 64
+
+    monkeypatch.setattr(
+        api,
+        "hash_invitation_token",
+        fake_hash_invitation_token,
+    )
+
+    # Mock password hashing.
+    def fake_hash_password(password):
+        assert password == "StrongPassword123"
+        return "fake-password-hash"
+
+    monkeypatch.setattr(
+        api,
+        "hash_password",
+        fake_hash_password,
+    )
+
+    # Mock user registration and invitation acceptance.
+    def fake_register_user_and_accept_invitation(
+        token_hash,
+        email,
+        password_hash,
+    ):
+        assert token_hash == "a" * 64
+        assert email == "invited@example.com"
+        assert password_hash == "fake-password-hash"
+
+        return expected_registration
+
+    monkeypatch.setattr(
+        api,
+        "register_user_and_accept_invitation",
+        fake_register_user_and_accept_invitation,
+    )
+
+    # Mock JWT generation.
+    def fake_create_access_token(user_id, tenant_id, role):
+        assert user_id == str(TEST_USER_ID)
+        assert tenant_id == str(TEST_TENANT_ID)
+        assert role == "member"
+
+        return "fake-access-token"
+
+    monkeypatch.setattr(
+        api,
+        "create_access_token",
+        fake_create_access_token,
+    )
+
+    response = client.post(
+        "/auth/register-and-accept-invitation",
+        json={
+            "token": "raw-invitation-token",
+            "email": "INVITED@example.com",
+            "password": "StrongPassword123",
+        },
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["access_token"] == "fake-access-token"
+    assert data["token_type"] == "bearer"
+    assert data["tenant_id"] == str(TEST_TENANT_ID)
+    assert data["role"] == "member"
+    assert data["expires_in"] == (
+        api.settings.access_token_expire_minutes * 60
+    )
+
+
+def test_register_and_accept_invitation_rejects_permission_error(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        api,
+        "hash_invitation_token",
+        lambda token: "a" * 64,
+    )
+
+    monkeypatch.setattr(
+        api,
+        "hash_password",
+        lambda password: "fake-password-hash",
+    )
+
+    def fake_register_user_and_accept_invitation(
+        token_hash,
+        email,
+        password_hash,
+    ):
+        raise PermissionError("Invitation has been revoked.")
+
+    monkeypatch.setattr(
+        api,
+        "register_user_and_accept_invitation",
+        fake_register_user_and_accept_invitation,
+    )
+
+    response = client.post(
+        "/auth/register-and-accept-invitation",
+        json={
+            "token": "raw-invitation-token",
+            "email": "invited@example.com",
+            "password": "StrongPassword123",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invitation has been revoked."
+
+
+def test_register_and_accept_invitation_rejects_value_error(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        api,
+        "hash_invitation_token",
+        lambda token: "a" * 64,
+    )
+
+    monkeypatch.setattr(
+        api,
+        "hash_password",
+        lambda password: "fake-password-hash",
+    )
+
+    def fake_register_user_and_accept_invitation(
+        token_hash,
+        email,
+        password_hash,
+    ):
+        raise ValueError(
+            "An account with this email already exists."
+        )
+
+    monkeypatch.setattr(
+        api,
+        "register_user_and_accept_invitation",
+        fake_register_user_and_accept_invitation,
+    )
+
+    response = client.post(
+        "/auth/register-and-accept-invitation",
+        json={
+            "token": "raw-invitation-token",
+            "email": "invited@example.com",
+            "password": "StrongPassword123",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "An account with this email already exists."
+    )
 
 
 # ---------------------------------------------------------

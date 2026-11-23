@@ -57,6 +57,7 @@ def _build_payload(chunk: Chunk) -> dict:
         "start_page": chunk.start_page,
         "end_page": chunk.end_page,
         "source_pages": chunk.source_pages,
+        "section_type": chunk.section_type,
     }
 
 

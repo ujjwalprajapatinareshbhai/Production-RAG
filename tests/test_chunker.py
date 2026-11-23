@@ -135,6 +135,83 @@ def test_extract_abstract_returns_none_when_empty():
     ) is None
 
 
+def test_chunk_pages_marks_abstract_section():
+    pages = [
+        Page(
+            document_id="test-document",
+            filename="sample.pdf",
+            page_number=5,
+            text=(
+                "Abstract\n\n"
+                "This report studies software testing problems.\n"
+                "It proposes an improved testing process."
+            ),
+        )
+    ]
+
+    chunks = chunk_pages(
+        pages,
+        tenant_id=TEST_TENANT_ID,
+        chunk_size=100,
+        overlap=0,
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].section_type == "abstract"
+
+
+def test_chunk_pages_does_not_mark_toc_entry_as_abstract():
+    pages = [
+        Page(
+            document_id="test-document",
+            filename="sample.pdf",
+            page_number=3,
+            text=(
+                "Table of Contents\n\n"
+                "Abstract ........ 5\n\n"
+                "1 Introduction ........ 6"
+            ),
+        )
+    ]
+
+    chunks = chunk_pages(
+        pages,
+        tenant_id=TEST_TENANT_ID,
+        chunk_size=100,
+        overlap=0,
+    )
+
+    assert chunks
+    assert all(
+        chunk.section_type == "general"
+        for chunk in chunks
+    )
+
+
+def test_chunk_pages_does_not_mark_normal_abstract_mention_as_section():
+    pages = [
+        Page(
+            document_id="test-document",
+            filename="sample.pdf",
+            page_number=1,
+            text=(
+                "This document contains an abstract discussion "
+                "of software testing."
+            ),
+        )
+    ]
+
+    chunks = chunk_pages(
+        pages,
+        tenant_id=TEST_TENANT_ID,
+        chunk_size=100,
+        overlap=0,
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].section_type == "general"
+
+
 if __name__ == "__main__":
     test_chunk_count_and_overlap()
     test_page_metadata()

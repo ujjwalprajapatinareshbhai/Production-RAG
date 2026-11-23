@@ -1,3 +1,4 @@
+
 import hashlib
 import re
 from uuid import UUID
@@ -63,10 +64,11 @@ def chunk_pages(
     tenant_id: UUID,
 ) -> list[Chunk]:
     """
-    Split pages into overlapping word-based chunks.
+    Split pages into overlapping chunks and preserve section metadata.
 
-    Preserve paragraph boundaries and track the source pages
-    represented in every chunk.
+    Existing chunk text, word order, overlap, IDs, and page tracking
+    are preserved. Section metadata identifies chunks belonging
+    entirely to the Abstract section.
     """
 
     _validate_chunk_settings(chunk_size, overlap)
@@ -82,20 +84,129 @@ def chunk_pages(
     words: list[str] = []
     word_pages: list[int] = []
     paragraph_starts: list[bool] = []
+    word_sections: list[str] = []
 
-    for page in pages:
+    # ---------------------------------------------------------
+    # 1. Find the Table of Contents and the real Abstract page.
+    # ---------------------------------------------------------
+
+    toc_start_index = None
+    abstract_page_index = None
+
+    for page_index, page in enumerate(pages):
+        lines = clean_text(page.text).splitlines()
+
+        has_toc_heading = any(
+            re.fullmatch(
+                r"\s*table\s+of\s+contents\s*",
+                line,
+                flags=re.IGNORECASE,
+            )
+            for line in lines
+        )
+
+        if toc_start_index is None and has_toc_heading:
+            toc_start_index = page_index
+            continue
+
+        if toc_start_index is not None and page_index > toc_start_index:
+            has_abstract_heading = any(
+                re.fullmatch(
+                    r"\s*(?:\d+\s+)?abstract\s*",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+                for line in lines
+            )
+
+            if has_abstract_heading:
+                abstract_page_index = page_index
+                break
+
+    # ---------------------------------------------------------
+    # 2. Define section heading patterns.
+    # ---------------------------------------------------------
+
+    abstract_heading = re.compile(
+        r"^\s*(?:\d+\s+)?abstract\s*$",
+        re.IGNORECASE,
+    )
+
+    section_heading = re.compile(
+        r"^\s*\d+(?:\.\d+)*\.?\s+[A-Z][A-Za-z /&()\-,:]*\s*$"
+    )
+
+    # ---------------------------------------------------------
+    # 3. Read words and track their section types.
+    # ---------------------------------------------------------
+
+    current_section = "general"
+
+    for page_index, page in enumerate(pages):
         cleaned_text = clean_text(page.text)
+
+        # Keep TOC words in the document, but do not classify
+        # their entries as real document sections.
+        is_toc_page = (
+            toc_start_index is not None
+            and abstract_page_index is not None
+            and toc_start_index <= page_index < abstract_page_index
+        )
+
+        if is_toc_page:
+            current_section = "general"
 
         for paragraph in cleaned_text.split("\n\n"):
             paragraph_words = paragraph.split()
 
+            if not paragraph_words:
+                continue
+
+            # Determine the section of each word by examining
+            # the original lines before flattening the paragraph.
+            paragraph_word_sections: list[str] = []
+
+            for line in paragraph.splitlines():
+                stripped_line = line.strip()
+
+                if not stripped_line:
+                    continue
+
+                if not is_toc_page:
+                    if abstract_heading.fullmatch(stripped_line):
+                        current_section = "abstract"
+
+                    elif section_heading.fullmatch(stripped_line):
+                        current_section = "general"
+
+                line_words = stripped_line.split()
+
+                paragraph_word_sections.extend(
+                    [current_section] * len(line_words)
+                )
+
+            if len(paragraph_words) != len(paragraph_word_sections):
+                raise ValueError(
+                    "Word and section metadata counts do not match."
+                )
+
             for word_index, word in enumerate(paragraph_words):
                 words.append(word)
                 word_pages.append(page.page_number)
+
+                # Preserve the original paragraph boundary behavior.
                 paragraph_starts.append(word_index == 0)
+
+                word_sections.append(
+                    paragraph_word_sections[word_index]
+                )
 
     if not words:
         return []
+
+    # ---------------------------------------------------------
+    # 4. Create chunks using the original chunking behavior.
+    # ---------------------------------------------------------
 
     chunks: list[Chunk] = []
     step = chunk_size - overlap
@@ -111,10 +222,21 @@ def chunk_pages(
                 if paragraph_starts[global_index]
                 else " "
             )
+
             chunk_text += separator + words[global_index]
 
         source_pages = list(dict.fromkeys(word_pages[start:end]))
         chunk_index = len(chunks)
+
+        # A chunk is Abstract only when every word belongs
+        # to the Abstract section.
+        section_types = set(word_sections[start:end])
+
+        section_type = (
+            "abstract"
+            if "abstract" in section_types
+            else "general"
+        )
 
         chunks.append(
             Chunk(
@@ -132,6 +254,7 @@ def chunk_pages(
                 start_page=source_pages[0],
                 end_page=source_pages[-1],
                 source_pages=source_pages,
+                section_type=section_type,
             )
         )
 

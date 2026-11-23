@@ -1,6 +1,8 @@
+
 from uuid import UUID
 
 from app.context_selector import (
+    _query_requests_report_summary,
     classify_query_intent,
     select_context,
 )
@@ -34,10 +36,13 @@ def search_documents(
     # Classify once so retrieval and context selection share the intent.
     intent = classify_query_intent(query)
 
-    # Overview questions need a deeper candidate pool to find the abstract.
+    # Explicit abstract/summary questions need deeper retrieval,
+    # even when the intent classifier returns specific_detail or other.
+    is_report_summary = _query_requests_report_summary(query)
+
     retrieval_limit = candidate_limit
 
-    if intent == "overview":
+    if intent == "overview" or is_report_summary:
         retrieval_limit = max(
             candidate_limit,
             OVERVIEW_CANDIDATE_LIMIT,

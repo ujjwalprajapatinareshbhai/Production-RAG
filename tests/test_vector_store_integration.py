@@ -36,6 +36,7 @@ def test_upsert_stores_dense_and_sparse_vectors():
         start_page=1,
         end_page=1,
         source_pages=[1],
+        section_type="abstract"
     )
 
     point_id = str(uuid5(NAMESPACE_URL, test_chunk_id))
@@ -60,6 +61,7 @@ def test_upsert_stores_dense_and_sparse_vectors():
         assert point.payload["tenant_id"] == str(tenant_id)
         assert point.payload["document_id"] == chunk.document_id
         assert point.payload["text"] == chunk.text
+        assert point.payload["section_type"] == "abstract"
 
         assert isinstance(point.vector, dict)
         assert "" in point.vector

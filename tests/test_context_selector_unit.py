@@ -114,7 +114,7 @@ def test_overview_prioritizes_abstract():
         [63],
     ]
 
-    chat.assert_called_once()
+    chat.assert_not_called()
 
 def test_overview_topic_question_preserves_ranking():
     chunks = [

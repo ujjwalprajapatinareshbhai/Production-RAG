@@ -1,3 +1,4 @@
+
 import json
 import logging
 
@@ -27,10 +28,10 @@ def classify_query_intent(query: str) -> str:
             model=INTENT_MODEL,
             messages=[
                 {
-                     "role": "system",
-                     "content": """You classify questions about a document into exactly one intent.
+                    "role": "system",
+                    "content": """You classify questions about a document into exactly one intent.
 
-                Choose one of these intents:
+Choose one of these intents:
 
 - overview: asks for the document's overall purpose, main goal,
   motivation, broad challenges, key findings, major problems,
@@ -86,13 +87,17 @@ Do not include explanations or Markdown."""
         result = json.loads(raw_output)
 
         if not isinstance(result, dict):
-            logger.warning("Intent classifier returned a non-object JSON value.")
+            logger.warning(
+                "Intent classifier returned a non-object JSON value."
+            )
             return "other"
 
         intent = result.get("intent")
 
         if not isinstance(intent, str) or intent not in VALID_INTENTS:
-            logger.warning("Intent classifier returned an invalid intent.")
+            logger.warning(
+                "Intent classifier returned an invalid intent."
+            )
             return "other"
 
         return intent
@@ -103,17 +108,24 @@ Do not include explanations or Markdown."""
 
     except Exception:
         logger.exception(
-            "Gemma Cloud intent classification failed; using fallback intent."
+            "Gemma Cloud intent classification failed; "
+            "using fallback intent."
         )
         return "other"
 
 
 def _query_requests_report_summary(query: str) -> bool:
-    """Return True when the question asks for a report-level summary or purpose."""
+    """Return True when the question requests an abstract or report summary."""
 
-    query_lower = query.lower()
+    query_lower = query.lower().strip()
 
     summary_phrases = (
+        # Abstract requests
+        "abstract",
+        "give me the abstract",
+        "provide the abstract",
+        "show me the abstract",
+
         # Overall purpose / goal
         "overall purpose",
         "main purpose of this report",
@@ -126,6 +138,7 @@ def _query_requests_report_summary(query: str) -> bool:
         "objective of this research",
         "goal of this study",
         "goal of this research",
+
         # Why was it done
         "why was this study",
         "why was the study",
@@ -133,6 +146,7 @@ def _query_requests_report_summary(query: str) -> bool:
         "why was the research",
         "why was this report",
         "why was the report",
+
         # Summaries
         "summarize this report",
         "summarise this report",
@@ -140,6 +154,7 @@ def _query_requests_report_summary(query: str) -> bool:
         "summarize the report",
         "summarise the report",
         "overall summary",
+
         # Findings / conclusions
         "key findings of this research",
         "overall conclusions",
@@ -177,16 +192,8 @@ def select_context(
     if not abstracts:
         return ranked_chunks[:limit]
 
-    if intent is None:
-        intent = classify_query_intent(query)
-
-    if intent not in VALID_INTENTS:
-        intent = "other"
-
-    should_prioritize_abstract = (
-        intent == "overview"
-        and _query_requests_report_summary(query)
-    )
+    # Check the query directly instead of depending on Gemma's classification.
+    should_prioritize_abstract = _query_requests_report_summary(query)
 
     if not should_prioritize_abstract:
         return ranked_chunks[:limit]

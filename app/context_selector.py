@@ -165,6 +165,29 @@ def _query_requests_report_summary(query: str) -> bool:
         for phrase in summary_phrases
     )
 
+def _query_requests_abstract(query: str) -> bool:
+    """Return True when the user explicitly requests the document abstract."""
+
+    query_lower = query.lower().strip()
+
+    abstract_phrases = (
+        "abstract",
+        "give me the abstract",
+        "provide the abstract",
+        "show me the abstract",
+        "display the abstract",
+        "fetch the abstract",
+        "what is the abstract",
+        "tell me the abstract",
+        "document abstract",
+        "research abstract",
+        "paper abstract",
+    )
+
+    return any(
+        phrase in query_lower
+        for phrase in abstract_phrases
+    )
 
 def select_context(
     query: str,
@@ -172,7 +195,7 @@ def select_context(
     limit: int = 3,
     intent: str | None = None,
 ) -> list[dict]:
-    """Select passages for the final answer."""
+    """Select the most relevant passages using reranker order."""
 
     if not query or not query.strip():
         raise ValueError("Query cannot be empty.")
@@ -183,30 +206,6 @@ def select_context(
     if not ranked_chunks:
         return []
 
-    abstracts = [
-        chunk
-        for chunk in ranked_chunks
-        if chunk.get("section_type") == "abstract"
-    ]
-
-    if not abstracts:
-        return ranked_chunks[:limit]
-
-    # Check the query directly instead of depending on Gemma's classification.
-    should_prioritize_abstract = _query_requests_report_summary(query)
-
-    if not should_prioritize_abstract:
-        return ranked_chunks[:limit]
-
-    selected = [abstracts[0]]
-
-    for chunk in ranked_chunks:
-        if chunk.get("section_type") == "abstract":
-            continue
-
-        selected.append(chunk)
-
-        if len(selected) >= limit:
-            break
-
-    return selected[:limit]
+    # The CrossEncoder has already ranked all candidates.
+    # Preserve that ranking without section-based prioritization.
+    return ranked_chunks[:limit]

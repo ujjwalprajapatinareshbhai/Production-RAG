@@ -244,3 +244,122 @@ def test_specific_detail_query_uses_default_retrieval_depth(monkeypatch):
     # Context selection retains its default output limit.
     assert calls["selector"]["limit"] == 3
     assert calls["selector"]["intent"] == "specific_detail"
+
+def test_abstract_request_uses_direct_retrieval(monkeypatch):
+    """Explicit abstract requests should retrieve the abstract directly."""
+
+    calls = {}
+
+    abstract_chunks = [
+        {
+            "chunk_id": "abstract-1",
+            "text": "This is the document abstract.",
+            "source_pages": [5],
+            "section_type": "abstract",
+        }
+    ]
+
+    def fake_search_document_abstract(**kwargs):
+        calls["abstract"] = kwargs
+        return abstract_chunks
+
+    def fake_classify_query_intent(query):
+        calls["classifier"] = query
+        raise AssertionError(
+            "Abstract requests should skip query classification."
+        )
+
+    def fake_hybrid_search(**kwargs):
+        raise AssertionError(
+            "Abstract requests should skip hybrid retrieval."
+        )
+
+    def fake_rerank(query, candidates, limit):
+        raise AssertionError(
+            "Abstract requests should skip reranking."
+        )
+
+    monkeypatch.setattr(
+        search_module,
+        "search_document_abstract",
+        fake_search_document_abstract,
+    )
+    monkeypatch.setattr(
+        search_module,
+        "classify_query_intent",
+        fake_classify_query_intent,
+    )
+    monkeypatch.setattr(
+        search_module,
+        "search_qdrant_hybrid",
+        fake_hybrid_search,
+    )
+    monkeypatch.setattr(
+        search_module,
+        "rerank_chunks",
+        fake_rerank,
+    )
+
+    results = search_module.search_documents(
+        tenant_id=TEST_TENANT_ID,
+        query="What is the abstract of this document?",
+        limit=3,
+        document_id="test-document",
+    )
+
+    assert calls["abstract"]["tenant_id"] == TEST_TENANT_ID
+    assert calls["abstract"]["document_id"] == "test-document"
+
+    assert "classifier" not in calls
+    assert results == abstract_chunks
+
+
+def test_abstract_request_returns_empty_when_abstract_missing(monkeypatch):
+    """Return an empty result when no abstract chunk exists."""
+
+    calls = {}
+
+    def fake_search_document_abstract(**kwargs):
+        calls["abstract"] = kwargs
+        return []
+
+    monkeypatch.setattr(
+        search_module,
+        "search_document_abstract",
+        fake_search_document_abstract,
+    )
+
+    results = search_module.search_documents(
+        tenant_id=TEST_TENANT_ID,
+        query="Show me the abstract.",
+        document_id="test-document",
+    )
+
+    assert calls["abstract"]["tenant_id"] == TEST_TENANT_ID
+    assert calls["abstract"]["document_id"] == "test-document"
+    assert results == []
+
+
+def test_abstract_request_preserves_custom_collection(monkeypatch):
+    """Direct abstract retrieval should support custom collections."""
+
+    calls = {}
+
+    def fake_search_document_abstract(**kwargs):
+        calls["abstract"] = kwargs
+        return []
+
+    monkeypatch.setattr(
+        search_module,
+        "search_document_abstract",
+        fake_search_document_abstract,
+    )
+
+    search_module.search_documents(
+        tenant_id=TEST_TENANT_ID,
+        query="What is the abstract?",
+        document_id="test-document",
+        collection_name="document_chunks_test",
+    )
+
+    assert calls["abstract"]["collection_name"] == "document_chunks_test"

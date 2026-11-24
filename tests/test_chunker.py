@@ -211,6 +211,75 @@ def test_chunk_pages_does_not_mark_normal_abstract_mention_as_section():
     assert len(chunks) == 1
     assert chunks[0].section_type == "general"
 
+def test_chunk_pages_extracts_abstract_without_mixing_general_content():
+    pages = [
+        Page(
+            document_id="test-document",
+            filename="sample.pdf",
+            page_number=4,
+            text=(
+                "Table of Contents\n\n"
+                "Table of Figures\n\n"
+                "Figure 1: Testing workflow"
+            ),
+        ),
+        Page(
+            document_id="test-document",
+            filename="sample.pdf",
+            page_number=5,
+            text=(
+                "5 Abstract\n\n"
+                "Small companies need high quality software.\n"
+                "This report investigates software testing.\n"
+                "It proposes an improved testing process."
+            ),
+        ),
+        Page(
+            document_id="test-document",
+            filename="sample.pdf",
+            page_number=6,
+            text=(
+                "6\n"
+                "1 Introduction\n\n"
+                "Software has become important in modern society."
+            ),
+        ),
+    ]
+
+    chunks = chunk_pages(
+        pages,
+        tenant_id=TEST_TENANT_ID,
+        chunk_size=100,
+        overlap=0,
+    )
+
+    abstract_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.section_type == "abstract"
+    ]
+
+    assert len(abstract_chunks) == 1
+
+    abstract = abstract_chunks[0]
+
+    assert abstract.source_pages == [5]
+    assert "high quality software" in abstract.text
+    assert "improved testing process" in abstract.text
+    assert "Table of Figures" not in abstract.text
+    assert "Introduction" not in abstract.text
+
+    general_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.section_type == "general"
+    ]
+
+    assert all(
+        "improved testing process" not in chunk.text
+        for chunk in general_chunks
+    )
+
 
 if __name__ == "__main__":
     test_chunk_count_and_overlap()

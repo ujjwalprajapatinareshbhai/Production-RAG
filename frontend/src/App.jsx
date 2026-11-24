@@ -404,7 +404,6 @@ function App() {
 
         </section>
 
-
         {/* Document Search */}
 
         <section className="search-section">
@@ -473,7 +472,7 @@ function App() {
 
                     {typeof result.reranker_score === 'number' && (
                       <span>
-                        Relevance: {result.reranker_score.toFixed(3)}
+                        Reranker score: {result.reranker_score.toFixed(3)}
                       </span>
                     )}
 
@@ -487,7 +486,6 @@ function App() {
           )}
 
         </section>
-
 
         {/* Dashboard Error */}
 

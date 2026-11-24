@@ -1,4 +1,3 @@
-
 import hashlib
 import re
 from uuid import UUID
@@ -64,11 +63,14 @@ def chunk_pages(
     tenant_id: UUID,
 ) -> list[Chunk]:
     """
-    Split pages into overlapping chunks and preserve section metadata.
+    Split a document into overlapping general chunks and a
+    separate standalone Abstract chunk.
 
-    Existing chunk text, word order, overlap, IDs, and page tracking
-    are preserved. Section metadata identifies chunks belonging
-    entirely to the Abstract section.
+    General chunking preserves word order, overlap, paragraph
+    boundaries, and source-page tracking.
+
+    Abstract content is excluded from general chunks to avoid
+    duplicate and mixed-section passages.
     """
 
     _validate_chunk_settings(chunk_size, overlap)
@@ -145,8 +147,8 @@ def chunk_pages(
     for page_index, page in enumerate(pages):
         cleaned_text = clean_text(page.text)
 
-        # Keep TOC words in the document, but do not classify
-        # their entries as real document sections.
+        # Keep TOC words as general content.
+        # Do not interpret TOC entries as actual section headings.
         is_toc_page = (
             toc_start_index is not None
             and abstract_page_index is not None
@@ -162,8 +164,6 @@ def chunk_pages(
             if not paragraph_words:
                 continue
 
-            # Determine the section of each word by examining
-            # the original lines before flattening the paragraph.
             paragraph_word_sections: list[str] = []
 
             for line in paragraph.splitlines():
@@ -194,18 +194,40 @@ def chunk_pages(
                 words.append(word)
                 word_pages.append(page.page_number)
 
-                # Preserve the original paragraph boundary behavior.
                 paragraph_starts.append(word_index == 0)
 
                 word_sections.append(
                     paragraph_word_sections[word_index]
                 )
 
-    if not words:
-        return []
+    # ---------------------------------------------------------
+    # 4. Extract the Abstract independently.
+    # ---------------------------------------------------------
+
+    abstract_chunk = extract_abstract_chunk(
+        pages,
+        tenant_id=tenant_id,
+    )
+
+    # Remove Abstract words from ordinary chunking.
+    # They will be stored only in the standalone Abstract chunk.
+    general_entries = [
+        (word, page_number, paragraph_start)
+        for word, page_number, paragraph_start, section in zip(
+            words,
+            word_pages,
+            paragraph_starts,
+            word_sections,
+        )
+        if section != "abstract"
+    ]
+
+    words = [entry[0] for entry in general_entries]
+    word_pages = [entry[1] for entry in general_entries]
+    paragraph_starts = [entry[2] for entry in general_entries]
 
     # ---------------------------------------------------------
-    # 4. Create chunks using the original chunking behavior.
+    # 5. Create ordinary chunks.
     # ---------------------------------------------------------
 
     chunks: list[Chunk] = []
@@ -228,16 +250,6 @@ def chunk_pages(
         source_pages = list(dict.fromkeys(word_pages[start:end]))
         chunk_index = len(chunks)
 
-        # A chunk is Abstract only when every word belongs
-        # to the Abstract section.
-        section_types = set(word_sections[start:end])
-
-        section_type = (
-            "abstract"
-            if "abstract" in section_types
-            else "general"
-        )
-
         chunks.append(
             Chunk(
                 chunk_id=generate_chunk_id(
@@ -254,12 +266,28 @@ def chunk_pages(
                 start_page=source_pages[0],
                 end_page=source_pages[-1],
                 source_pages=source_pages,
-                section_type=section_type,
+                section_type="general",
             )
         )
 
         if end == len(words):
             break
+
+    # ---------------------------------------------------------
+    # 6. Append the standalone Abstract chunk.
+    # ---------------------------------------------------------
+
+    if abstract_chunk is not None:
+        abstract_chunk.chunk_index = len(chunks)
+
+        abstract_chunk.chunk_id = generate_chunk_id(
+            tenant_id=tenant_id,
+            document_id=document_id,
+            chunk_index=abstract_chunk.chunk_index,
+            chunk_text=abstract_chunk.text,
+        )
+
+        chunks.append(abstract_chunk)
 
     return chunks
 
@@ -327,11 +355,14 @@ def extract_abstract_chunk(
     pages: list[Page],
     *,
     tenant_id: UUID,
+    chunk_index: int | None = None,
 ) -> Chunk | None:
     """
-    Extract the abstract as a standalone chunk.
+    Extract the Abstract as a standalone chunk.
 
+    Supports Abstract content spanning multiple PDF pages.
     Stops at the next numbered section heading.
+    Ignores standalone printed PDF page numbers.
     """
 
     abstract_heading = re.compile(
@@ -343,42 +374,111 @@ def extract_abstract_chunk(
         r"^\s*\d+(?:\.\d+)*\.?\s+[A-Z][A-Za-z /&()\-,:]*\s*$"
     )
 
+    abstract_started = False
+    abstract_lines: list[str] = []
+    abstract_pages: list[int] = []
+
+    document_id = None
+    filename = None
+
     for page in pages:
         lines = page.text.splitlines()
 
-        for index, line in enumerate(lines):
-            if not abstract_heading.match(line):
+        for line in lines:
+            stripped_line = line.strip()
+
+            if not abstract_started:
+                if abstract_heading.fullmatch(stripped_line):
+                    abstract_started = True
+                    document_id = page.document_id
+                    filename = page.filename
+
                 continue
 
-            abstract_lines = []
+            # Ignore standalone PDF page numbers.
+            # For example, page 6 may begin with:
+            # 6
+            # 1 Introduction
+            #
+            # The number 6 is page metadata, not Abstract content.
+            if re.fullmatch(r"\d+", stripped_line):
+                continue
 
-            for next_line in lines[index + 1:]:
-                if section_heading.match(next_line):
-                    break
+            # Stop when the next numbered section begins.
+            if section_heading.fullmatch(stripped_line):
+                abstract_text = clean_text(
+                    "\n".join(abstract_lines)
+                )
 
-                abstract_lines.append(next_line)
+                if not abstract_text:
+                    return None
 
-            abstract_text = clean_text("\n".join(abstract_lines))
+                actual_chunk_index = (
+                    chunk_index
+                    if chunk_index is not None
+                    else page.page_number
+                )
 
-            if not abstract_text:
-                return None
+                source_pages = list(dict.fromkeys(abstract_pages))
 
-            return Chunk(
-                chunk_id=generate_chunk_id(
+                return Chunk(
+                    chunk_id=generate_chunk_id(
+                        tenant_id=tenant_id,
+                        document_id=document_id,
+                        chunk_index=actual_chunk_index,
+                        chunk_text=abstract_text,
+                    ),
                     tenant_id=tenant_id,
-                    document_id=page.document_id,
-                    chunk_index=page.page_number,
-                    chunk_text=abstract_text,
-                ),
+                    document_id=document_id,
+                    filename=filename,
+                    chunk_index=actual_chunk_index,
+                    text=abstract_text,
+                    start_page=source_pages[0],
+                    end_page=source_pages[-1],
+                    source_pages=source_pages,
+                    section_type="abstract",
+                )
+
+            if stripped_line:
+                abstract_lines.append(stripped_line)
+
+                if page.page_number not in abstract_pages:
+                    abstract_pages.append(page.page_number)
+
+    # Handle a document where the Abstract reaches the end of the PDF.
+    if abstract_started:
+        abstract_text = clean_text(
+            "\n".join(abstract_lines)
+        )
+
+        if not abstract_text:
+            return None
+
+        actual_chunk_index = (
+            chunk_index
+            if chunk_index is not None
+            else pages[-1].page_number
+        )
+
+        source_pages = list(dict.fromkeys(abstract_pages))
+
+        return Chunk(
+            chunk_id=generate_chunk_id(
                 tenant_id=tenant_id,
-                document_id=page.document_id,
-                filename=page.filename,
-                chunk_index=page.page_number,
-                text=abstract_text,
-                start_page=page.page_number,
-                end_page=page.page_number,
-                source_pages=[page.page_number],
-            )
+                document_id=document_id,
+                chunk_index=actual_chunk_index,
+                chunk_text=abstract_text,
+            ),
+            tenant_id=tenant_id,
+            document_id=document_id,
+            filename=filename,
+            chunk_index=actual_chunk_index,
+            text=abstract_text,
+            start_page=source_pages[0],
+            end_page=source_pages[-1],
+            source_pages=source_pages,
+            section_type="abstract",
+        )
 
     return None
 

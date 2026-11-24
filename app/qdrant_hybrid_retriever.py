@@ -143,3 +143,87 @@ def search_qdrant_hybrid(
         )
 
     return results
+
+def search_document_abstract(
+    tenant_id: UUID,
+    document_id: str,
+    collection_name: str = COLLECTION_NAME,
+) -> list[dict]:
+    """Retrieve the abstract chunk for one completed document."""
+
+    if not isinstance(tenant_id, UUID):
+        raise ValueError("tenant_id must be a UUID.")
+
+    if not document_id or not document_id.strip():
+        raise ValueError("document_id cannot be empty.")
+
+    document_id = document_id.strip()
+
+    # Verify that the document belongs to this tenant and is completed.
+    document = get_document(tenant_id, document_id)
+
+    if document is None or document["status"] != "completed":
+        return []
+
+    # Require all three conditions:
+    # 1. Correct tenant.
+    # 2. Correct document.
+    # 3. Abstract section only.
+    query_filter = models.Filter(
+        must=[
+            models.FieldCondition(
+                key="tenant_id",
+                match=models.MatchValue(value=str(tenant_id)),
+            ),
+            models.FieldCondition(
+                key="document_id",
+                match=models.MatchValue(value=document_id),
+            ),
+            models.FieldCondition(
+                key="section_type",
+                match=models.MatchValue(value="abstract"),
+            ),
+        ]
+    )
+
+    client = get_vector_client()
+
+    points, _ = client.scroll(
+        collection_name=collection_name,
+        scroll_filter=query_filter,
+        limit=1,
+        with_payload=True,
+        with_vectors=False,
+    )
+
+    results = []
+
+    for point in points:
+        payload = point.payload or {}
+
+        # Additional ownership validation.
+        if payload.get("tenant_id") != str(tenant_id):
+            continue
+
+        if payload.get("document_id") != document_id:
+            continue
+
+        if payload.get("section_type") != "abstract":
+            continue
+
+        results.append(
+            {
+                "tenant_id": payload.get("tenant_id"),
+                "score": None,
+                "filename": payload.get("filename"),
+                "document_id": payload.get("document_id"),
+                "chunk_id": payload.get("chunk_id"),
+                "text": payload.get("text"),
+                "start_page": payload.get("start_page"),
+                "end_page": payload.get("end_page"),
+                "source_pages": payload.get("source_pages", []),
+                "section_type": payload.get("section_type"),
+            }
+        )
+
+    return results

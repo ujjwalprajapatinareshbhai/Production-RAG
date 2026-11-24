@@ -90,31 +90,24 @@ def test_no_abstract_skips_cloud_call():
     chat.assert_not_called()
 
 
-def test_overview_prioritizes_abstract():
+def test_overview_preserves_reranker_order():
     chunks = [
         make_chunk(58),
         make_chunk(63),
         make_chunk(5, "abstract"),
     ]
 
-    with patch("app.context_selector.ollama.chat") as chat:
-        chat.return_value = mock_ollama_response(
-            '{"intent": "overview"}'
-        )
-
-        result = select_context(
-            query="What is the overall purpose of this report?",
-            ranked_chunks=chunks,
-            limit=3,
-        )
+    result = select_context(
+        query="What is the overall purpose of this report?",
+        ranked_chunks=chunks,
+        limit=3,
+    )
 
     assert [chunk["source_pages"] for chunk in result] == [
-        [5],
         [58],
         [63],
+        [5],
     ]
-
-    chat.assert_not_called()
 
 def test_overview_topic_question_preserves_ranking():
     chunks = [
